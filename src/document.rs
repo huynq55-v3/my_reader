@@ -15,6 +15,8 @@ pub struct WordBbox {
     pub y_min: f32,
     pub x_max: f32,
     pub y_max: f32,
+    pub start_offset: usize, // relative to page text start
+    pub end_offset: usize,   // relative to page text start
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -311,6 +313,34 @@ mod tests {
             assert!(layout.words.iter().any(|w| w.text.contains("Mclntyre")));
         }
     }
+
+    #[test]
+    fn test_assign_word_offsets() {
+        let page_text = "OVER THE PAST few decades, electronic computer technology has made enormous strides.";
+        let mut words = vec![
+            WordBbox { text: "OVER".to_string(), x_min: 0.0, y_min: 0.0, x_max: 10.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+            WordBbox { text: "THE".to_string(), x_min: 15.0, y_min: 0.0, x_max: 25.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+            WordBbox { text: "PAST".to_string(), x_min: 30.0, y_min: 0.0, x_max: 40.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+            WordBbox { text: "few".to_string(), x_min: 45.0, y_min: 0.0, x_max: 55.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+            WordBbox { text: "decades,".to_string(), x_min: 60.0, y_min: 0.0, x_max: 75.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+            WordBbox { text: "electronic".to_string(), x_min: 80.0, y_min: 0.0, x_max: 100.0, y_max: 10.0, start_offset: 0, end_offset: 0 },
+        ];
+
+        assign_word_offsets(page_text, &mut words);
+
+        assert_eq!(words[0].start_offset, 0);
+        assert_eq!(words[0].end_offset, 4);
+        assert_eq!(words[1].start_offset, 5);
+        assert_eq!(words[1].end_offset, 8);
+        assert_eq!(words[2].start_offset, 9);
+        assert_eq!(words[2].end_offset, 13);
+        assert_eq!(words[3].start_offset, 14);
+        assert_eq!(words[3].end_offset, 17);
+        assert_eq!(words[4].start_offset, 18);
+        assert_eq!(words[4].end_offset, 26); // "decades," has 8 chars
+        assert_eq!(words[5].start_offset, 27);
+        assert_eq!(words[5].end_offset, 37);
+    }
 }
 
 pub fn parse_bbox_html(html: &str) -> Option<PageLayout> {
@@ -341,6 +371,8 @@ pub fn parse_bbox_html(html: &str) -> Option<PageLayout> {
             y_min,
             x_max,
             y_max,
+            start_offset: 0,
+            end_offset: 0,
         });
     }
 
@@ -351,6 +383,107 @@ pub fn parse_bbox_html(html: &str) -> Option<PageLayout> {
     })
 }
 
+pub fn assign_word_offsets(page_text: &str, words: &mut [WordBbox]) {
+    let mut current_pos = 0;
+    let text_len = page_text.len();
+
+    // Collect all char boundary byte positions in page_text
+    let char_boundaries: Vec<usize> = page_text
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(text_len))
+        .collect();
+
+    for word in words {
+        let word_len = word.text.len();
+        if word_len == 0 {
+            word.start_offset = current_pos;
+            word.end_offset = current_pos;
+            continue;
+        }
+
+        // Find character index of current_pos
+        let char_idx = match char_boundaries.binary_search(&current_pos) {
+            Ok(idx) => idx,
+            Err(idx) => idx.min(char_boundaries.len() - 1),
+        };
+
+        // Search in a character-boundary-safe window to avoid skipping ahead too far
+        let window_len_chars = 200;
+        let limit_char_idx = (char_idx + window_len_chars).min(char_boundaries.len() - 1);
+        let search_limit = char_boundaries[limit_char_idx];
+        
+        let search_window = &page_text[current_pos..search_limit];
+
+        // 1. Try exact match in the search window
+        if let Some(pos) = search_window.find(&word.text) {
+            let start = current_pos + pos;
+            word.start_offset = start;
+            word.end_offset = start + word_len;
+            current_pos = word.end_offset;
+            continue;
+        }
+
+        // 2. Try case-insensitive/normalized token match in search window
+        let norm_word = normalize_word(&word.text);
+        if !norm_word.is_empty() {
+            let mut found = false;
+            let mut match_start_byte = 0;
+            let mut match_end_byte = 0;
+
+            // Iterate over character indices of search_window to slice safely
+            for (i, _) in search_window.char_indices() {
+                let mut norm_sub = String::new();
+                for (sub_idx, ch) in search_window[i..].char_indices() {
+                    if ch.is_alphanumeric() {
+                        norm_sub.push_str(&ch.to_lowercase().to_string());
+                    }
+                    if norm_sub == norm_word {
+                        found = true;
+                        match_start_byte = current_pos + i;
+                        match_end_byte = current_pos + i + sub_idx + ch.len_utf8();
+                        break;
+                    }
+                    if norm_sub.len() > norm_word.len() {
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+
+            if found {
+                word.start_offset = match_start_byte;
+                word.end_offset = match_end_byte;
+                current_pos = match_end_byte;
+                continue;
+            }
+        }
+
+        // 3. Fallback to full search of the remaining page
+        let search_window_full = &page_text[current_pos..];
+        if let Some(pos) = search_window_full.find(&word.text) {
+            let start = current_pos + pos;
+            word.start_offset = start;
+            word.end_offset = start + word_len;
+            current_pos = word.end_offset;
+            continue;
+        }
+
+        // 4. Ultimate fallback (safely aligned to a character boundary)
+        let target_byte = current_pos + word_len;
+        let boundary_idx = match char_boundaries.binary_search(&target_byte) {
+            Ok(idx) => idx,
+            Err(idx) => idx.min(char_boundaries.len() - 1),
+        };
+        let end_boundary = char_boundaries[boundary_idx];
+        word.start_offset = current_pos;
+        word.end_offset = end_boundary;
+        current_pos = end_boundary;
+    }
+}
+
 fn normalize_word(w: &str) -> String {
     w.chars()
         .filter(|c| c.is_alphanumeric())
@@ -358,6 +491,7 @@ fn normalize_word(w: &str) -> String {
         .to_lowercase()
 }
 
+#[allow(dead_code)]
 pub fn find_segment_words(
     page_words: &[WordBbox],
     segment_text: &str,

@@ -358,7 +358,9 @@ impl UiApp {
         // 1. Unsegmented part of the target page
         let (page_start, _page_end) = page_offsets_all[current_page];
         let covered_until = self.cache.get_covered_until(&file_path_str, page_start, _page_end);
-        let unsegmented_text = &self.reader_state.pages[current_page][covered_until - page_start..];
+        let page_text = &self.reader_state.pages[current_page];
+        let relative_offset = (covered_until - page_start).min(page_text.len());
+        let unsegmented_text = &page_text[relative_offset..];
 
         let start_offset = 0;
         combined_text.push_str(unsegmented_text);
@@ -523,8 +525,12 @@ impl UiApp {
                         }
                     }
                 }
-                UiMessage::PageRendered { page_index, color_image, layout } => {
+                UiMessage::PageRendered { page_index, color_image, mut layout } => {
                     if self.reader_state.current_page == page_index {
+                        if page_index < self.reader_state.pages.len() {
+                            let page_text = &self.reader_state.pages[page_index];
+                            crate::document::assign_word_offsets(page_text, &mut layout.words);
+                        }
                         let texture = ctx.load_texture(
                             format!("pdf_page_{}", page_index),
                             color_image,
@@ -904,7 +910,7 @@ impl eframe::App for UiApp {
                                 }
                                 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("📄 Bản gốc (Original)").on_hover_text("Quay lại chế độ xem tài liệu thông thường").clicked() {
+                                    if ui.button("📄 Văn bản thường (Plain Text)").on_hover_text("Quay lại chế độ xem văn bản gốc chưa phân đoạn").clicked() {
                                         show_original_trigger = true;
                                     }
                                 });
@@ -1151,7 +1157,24 @@ impl eframe::App for UiApp {
         // Trigger retry AI segmentation outside central panel
         if retry_segmentation_trigger {
             self.is_segmented = true;
-            self.trigger_segmentation();
+            let current_page = self.reader_state.current_page;
+            let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+            let file_path_str = file_path.to_string_lossy().to_string();
+            let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+            let mut cache_hit = false;
+            
+            if current_page < page_offsets_all.len() {
+                let (page_start, page_end) = page_offsets_all[current_page];
+                let covered_until = self.cache.get_covered_until(&file_path_str, page_start, page_end);
+                if covered_until >= page_end {
+                    self.check_cache_or_reset();
+                    cache_hit = true;
+                }
+            }
+            
+            if !cache_hit {
+                self.trigger_segmentation();
+            }
         }
 
         // Trigger show original page text
@@ -1371,51 +1394,63 @@ impl UiApp {
             self.page_render_error = None;
         } else if let Some(data) = &self.rendered_page_data {
             if data.page_index == current_page {
+                // Calculate display size keeping aspect ratio using parent ui bounds (outside layouts)
+                let max_width = ui.available_width();
+                let max_height = ui.available_height() - 20.0;
+                
+                let img_size = data.texture.size_vec2();
+                let aspect_ratio = img_size.x / img_size.y;
+                
+                let display_width = max_width.min(max_height * aspect_ratio);
+                let display_height = display_width / aspect_ratio;
+                let display_size = egui::vec2(display_width, display_height);
+
+                let x_offset = (max_width - display_width) / 2.0;
+
                 egui::ScrollArea::both()
                     .id_source("pdf_visual_scroll")
                     .show(ui, |ui| {
-                        // Display the PDF page image
-                        let max_width = ui.available_width();
-                        let max_height = ui.available_height() - 10.0;
-                        
-                        let img_size = data.texture.size_vec2();
-                        let aspect_ratio = img_size.x / img_size.y;
-                        
-                        let display_width = max_width.min(max_height * aspect_ratio);
-                        let display_height = display_width / aspect_ratio;
-                        let display_size = egui::vec2(display_width, display_height);
+                        ui.horizontal(|ui| {
+                            // Center the image horizontally
+                            if x_offset > 0.0 {
+                                ui.add_space(x_offset);
+                            }
 
-                        let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::click());
+                            let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::click());
 
-                        // Draw the image
-                        let mut mesh = egui::Mesh::with_texture(data.texture.id());
-                        mesh.add_rect_with_uv(
-                            rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                        ui.painter().add(egui::Shape::mesh(mesh));
+                            // Draw the image
+                            let mut mesh = egui::Mesh::with_texture(data.texture.id());
+                            mesh.add_rect_with_uv(
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                            ui.painter().add(egui::Shape::mesh(mesh));
 
                         let page_width = data.layout.width;
                         let page_height = data.layout.height;
 
                         let mut hovered_segment_id = None;
 
+                        let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+                        let page_start = page_offsets_all.get(current_page).map(|&(s, _)| s).unwrap_or(0);
+
                         // Click handling on PDF image
-                        if response.clicked() {
+                        if self.is_segmented && response.clicked() {
                             if let Some(pointer_pos) = response.interact_pointer_pos() {
                                 // Map click to PDF coordinates
                                 let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
                                 let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
 
                                 // Find word under click
-                                if let Some(clicked_word_idx) = data.layout.words.iter().position(|w| {
+                                if let Some(clicked_word) = data.layout.words.iter().find(|w| {
                                     pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
                                 }) {
                                     // Search segments
                                     for segment in &self.reader_state.segments {
-                                        let matched = crate::document::find_segment_words(&data.layout.words, &segment.text);
-                                        if matched.contains(&clicked_word_idx) {
+                                        let seg_start_rel = segment.start_offset.saturating_sub(page_start);
+                                        let seg_end_rel = segment.end_offset.saturating_sub(page_start);
+                                        if clicked_word.start_offset < seg_end_rel && clicked_word.end_offset > seg_start_rel {
                                             self.selected_segment_id = Some(segment.id);
                                             let status = segment.status.clone();
                                             let segment_id = segment.id;
@@ -1449,18 +1484,21 @@ impl UiApp {
                         }
 
                         // Check hovering on image to highlight segment cards
-                        if let Some(pointer_pos) = response.hover_pos() {
-                            let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
-                            let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
+                        if self.is_segmented {
+                            if let Some(pointer_pos) = response.hover_pos() {
+                                let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
+                                let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
 
-                            if let Some(hovered_word_idx) = data.layout.words.iter().position(|w| {
-                                pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
-                            }) {
-                                for segment in &self.reader_state.segments {
-                                    let matched = crate::document::find_segment_words(&data.layout.words, &segment.text);
-                                    if matched.contains(&hovered_word_idx) {
-                                        hovered_segment_id = Some(segment.id);
-                                        break;
+                                if let Some(hovered_word) = data.layout.words.iter().find(|w| {
+                                    pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
+                                }) {
+                                    for segment in &self.reader_state.segments {
+                                        let seg_start_rel = segment.start_offset.saturating_sub(page_start);
+                                        let seg_end_rel = segment.end_offset.saturating_sub(page_start);
+                                        if hovered_word.start_offset < seg_end_rel && hovered_word.end_offset > seg_start_rel {
+                                            hovered_segment_id = Some(segment.id);
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -1472,47 +1510,49 @@ impl UiApp {
                         }
 
                         // Draw highlights for each segment
-                        for segment in &self.reader_state.segments {
-                            let matched_word_indices = crate::document::find_segment_words(&data.layout.words, &segment.text);
-                            if matched_word_indices.is_empty() {
-                                continue;
-                            }
+                        if self.is_segmented {
+                            for segment in &self.reader_state.segments {
+                                let seg_start_rel = segment.start_offset.saturating_sub(page_start);
+                                let seg_end_rel = segment.end_offset.saturating_sub(page_start);
 
-                            let is_selected = self.selected_segment_id == Some(segment.id);
-                            let is_hovered = self.hovered_segment_id == Some(segment.id);
+                                let is_selected = self.selected_segment_id == Some(segment.id);
+                                let is_hovered = self.hovered_segment_id == Some(segment.id);
 
-                            let fill_color = if is_selected {
-                                egui::Color32::from_rgba_unmultiplied(234, 179, 8, 80) // 30% yellow
-                            } else if is_hovered {
-                                egui::Color32::from_rgba_unmultiplied(59, 130, 246, 50) // 20% blue
-                            } else {
-                                egui::Color32::from_rgba_unmultiplied(16, 185, 129, 25) // 10% green (segment indicator)
-                            };
+                                let fill_color = if is_selected {
+                                    egui::Color32::from_rgba_unmultiplied(234, 179, 8, 80) // 30% yellow
+                                } else if is_hovered {
+                                    egui::Color32::from_rgba_unmultiplied(59, 130, 246, 50) // 20% blue
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(16, 185, 129, 25) // 10% green (segment indicator)
+                                };
 
-                            let stroke_color = if is_selected {
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(234, 179, 8))
-                            } else if is_hovered {
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246))
-                            } else {
-                                egui::Stroke::NONE
-                            };
+                                let stroke_color = if is_selected {
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(234, 179, 8))
+                                } else if is_hovered {
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246))
+                                } else {
+                                    egui::Stroke::NONE
+                                };
 
-                            for idx in matched_word_indices {
-                                let w = &data.layout.words[idx];
-                                let screen_x_min = rect.min.x + (w.x_min / page_width) * rect.width();
-                                let screen_x_max = rect.min.x + (w.x_max / page_width) * rect.width();
-                                let screen_y_min = rect.min.y + (w.y_min / page_height) * rect.height();
-                                let screen_y_max = rect.min.y + (w.y_max / page_height) * rect.height();
+                                for w in &data.layout.words {
+                                    if w.start_offset < seg_end_rel && w.end_offset > seg_start_rel {
+                                        let screen_x_min = rect.min.x + (w.x_min / page_width) * rect.width();
+                                        let screen_x_max = rect.min.x + (w.x_max / page_width) * rect.width();
+                                        let screen_y_min = rect.min.y + (w.y_min / page_height) * rect.height();
+                                        let screen_y_max = rect.min.y + (w.y_max / page_height) * rect.height();
 
-                                let word_rect = egui::Rect::from_min_max(
-                                    egui::pos2(screen_x_min, screen_y_min),
-                                    egui::pos2(screen_x_max, screen_y_max),
-                                );
+                                        let word_rect = egui::Rect::from_min_max(
+                                            egui::pos2(screen_x_min, screen_y_min),
+                                            egui::pos2(screen_x_max, screen_y_max),
+                                        );
 
-                                ui.painter().rect(word_rect, 2.0, fill_color, stroke_color);
+                                        ui.painter().rect(word_rect, 2.0, fill_color, stroke_color);
+                                    }
+                                }
                             }
                         }
                     });
+                });
             } else {
                 self.rendered_page_data = None;
             }
