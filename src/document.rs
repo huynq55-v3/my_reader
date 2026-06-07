@@ -13,6 +13,8 @@ pub enum SegmentStatus {
 pub struct DocumentSegment {
     pub id: usize,
     pub text: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
     pub status: SegmentStatus,
 }
 
@@ -145,13 +147,14 @@ impl ReaderState {
         self.segmentation_error = None;
     }
 
-    /// Update the segments list locally for the current page (fallback mechanism)
     fn update_segments(&mut self) {
         if self.pages.is_empty() || self.current_page >= self.pages.len() {
             self.segments = Vec::new();
             return;
         }
 
+        let page_offsets_all = self.get_page_absolute_offsets();
+        let page_start = page_offsets_all.get(self.current_page).map(|&(s, _)| s).unwrap_or(0);
         let page_text = &self.pages[self.current_page];
         
         let raw_paragraphs = page_text
@@ -161,15 +164,23 @@ impl ReaderState {
             .filter(|p| !p.is_empty())
             .collect::<Vec<_>>();
 
-        self.segments = raw_paragraphs
-            .into_iter()
-            .enumerate()
-            .map(|(id, text)| DocumentSegment {
+        let mut current_pos = 0;
+        let mut segments = Vec::new();
+        for (id, text) in raw_paragraphs.into_iter().enumerate() {
+            let relative_start = page_text[current_pos..].find(&text).unwrap_or(0);
+            let start_offset = page_start + current_pos + relative_start;
+            let end_offset = start_offset + text.len();
+            current_pos = current_pos + relative_start + text.len();
+
+            segments.push(DocumentSegment {
                 id,
                 text,
+                start_offset,
+                end_offset,
                 status: SegmentStatus::Idle,
-            })
-            .collect();
+            });
+        }
+        self.segments = segments;
     }
 
     /// Retrieve the text of pages [N-1, N, N+1] as Context

@@ -7,6 +7,8 @@ pub struct CachedSegment {
     pub text: String,
     pub start_offset: usize, // absolute character/byte offset in document
     pub end_offset: usize,   // absolute character/byte offset in document
+    #[serde(default)]
+    pub analysis: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -104,6 +106,25 @@ impl AppCache {
         let _ = self.save();
     }
 
+    /// Update the cached analysis for a specific segment identified by its absolute offsets
+    pub fn update_segment_analysis(
+        &mut self,
+        file_path: &str,
+        start_offset: usize,
+        end_offset: usize,
+        analysis: String,
+    ) {
+        if let Some(doc) = self.documents.get_mut(file_path) {
+            if let Some(seg) = doc.segments.iter_mut().find(|s| {
+                s.start_offset == start_offset && s.end_offset == end_offset
+            }) {
+                seg.analysis = Some(analysis);
+                let _ = self.save();
+            }
+        }
+    }
+
+
     /// Find how much of Page N (from page_start to page_end) is already covered
     /// by a cached segment. Returns the absolute byte offset `covered_until` (which is >= page_start).
     /// Allows crossing small formatting gaps (whitespace, newlines, separators) up to 15 bytes.
@@ -172,16 +193,19 @@ mod tests {
             text: "Hello page 0".to_string(),
             start_offset: 0,
             end_offset: 12,
+            analysis: None,
         };
         let seg2 = CachedSegment {
             text: "World page 0-1 split".to_string(),
             start_offset: 13,
             end_offset: 33,
+            analysis: None,
         };
         let seg3 = CachedSegment {
             text: "Hello page 1".to_string(),
             start_offset: 55,
             end_offset: 67,
+            analysis: None,
         };
 
         // Update cache (simulated save fails silently if config folder not writable, which is fine for tests)
@@ -235,6 +259,13 @@ mod tests {
         // Since 67 >= page_end 60, it stops and returns 67.
         let covered_p1_after_gap = cache.get_covered_until(file, 55, 60);
         assert_eq!(covered_p1_after_gap, 67);
+
+        // Test update_segment_analysis
+        cache.update_segment_analysis(file, 0, 12, "Analysis for page 0 segment".to_string());
+        
+        let updated_page_0_segs = cache.get_segments_for_page(file, 0, 20).unwrap();
+        assert_eq!(updated_page_0_segs[0].analysis, Some("Analysis for page 0 segment".to_string()));
+        assert_eq!(updated_page_0_segs[1].analysis, None);
     }
 }
 

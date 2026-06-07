@@ -246,7 +246,12 @@ impl UiApp {
                             .map(|(idx, seg)| DocumentSegment {
                                 id: idx,
                                 text: seg.text,
-                                status: SegmentStatus::Idle,
+                                start_offset: seg.start_offset,
+                                end_offset: seg.end_offset,
+                                status: match seg.analysis {
+                                    Some(ref analysis) => SegmentStatus::Analyzed(analysis.clone()),
+                                    None => SegmentStatus::Idle,
+                                },
                             })
                             .collect();
                         self.reader_state.segmentation_loading = false;
@@ -370,6 +375,7 @@ impl UiApp {
                                                 text,
                                                 start_offset: abs_start_offset + start,
                                                 end_offset: abs_start_offset + end,
+                                                analysis: None,
                                             })
                                             .collect();
 
@@ -416,7 +422,12 @@ impl UiApp {
                                             .map(|(idx, seg)| DocumentSegment {
                                                 id: idx,
                                                 text: seg.text,
-                                                status: SegmentStatus::Idle,
+                                                start_offset: seg.start_offset,
+                                                end_offset: seg.end_offset,
+                                                status: match seg.analysis {
+                                                    Some(ref analysis) => SegmentStatus::Analyzed(analysis.clone()),
+                                                    None => SegmentStatus::Idle,
+                                                },
                                             })
                                             .collect();
                                         self.is_segmented = true;
@@ -435,7 +446,18 @@ impl UiApp {
                             Ok(analysis) => {
                                 segment.status = SegmentStatus::Analyzed(analysis.clone());
                                 if self.selected_segment_id == Some(segment_id) {
-                                    self.active_analysis = Some(analysis);
+                                    self.active_analysis = Some(analysis.clone());
+                                }
+                                
+                                // Cache the analysis explanation persistently
+                                let file_path_str = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
+                                if !file_path_str.is_empty() {
+                                    self.cache.update_segment_analysis(
+                                        &file_path_str,
+                                        segment.start_offset,
+                                        segment.end_offset,
+                                        analysis,
+                                    );
                                 }
                             }
                             Err(e) => {
