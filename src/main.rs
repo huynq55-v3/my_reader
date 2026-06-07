@@ -1,17 +1,31 @@
 mod config;
 mod document;
 mod ai_client;
+mod cache;
 
 use config::AppConfig;
 use document::{ReaderState, DocumentSegment, SegmentStatus};
+use cache::AppCache;
 use eframe::egui;
 use std::path::PathBuf;
+
+pub struct SegmentationSuccess {
+    pub filtered_chunks: Vec<String>,
+    pub all_segments: Vec<(String, usize, usize)>, // (text, start, end in combined_text)
+    pub page_offsets: Vec<(usize, usize, usize)>,  // page, start, end in combined_text
+    pub file_path: PathBuf,
+    pub window_start_abs: usize,
+}
 
 pub enum WorkerMessage {
     LoadFile(PathBuf),
     SegmentText {
         config: AppConfig,
         combined_text: String,
+        page_offsets: Vec<(usize, usize, usize)>,
+        current_page: usize,
+        file_path: PathBuf,
+        window_start_abs: usize,
     },
     AnalyzeSegment {
         config: AppConfig,
@@ -23,13 +37,14 @@ pub enum WorkerMessage {
 
 pub enum UiMessage {
     FileLoaded(Result<ReaderState, String>),
-    SegmentationResult(Result<Vec<String>, String>),
+    SegmentationResult(Result<SegmentationSuccess, String>),
     AnalysisResult(usize, Result<String, String>),
 }
 
 pub struct UiApp {
     reader_state: ReaderState,
     config: AppConfig,
+    cache: AppCache,
     selected_segment_id: Option<usize>,
     active_analysis: Option<String>,
     tx: tokio::sync::mpsc::Sender<WorkerMessage>,
@@ -93,10 +108,48 @@ impl UiApp {
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerMessage::SegmentText { config, combined_text } => {
+                        WorkerMessage::SegmentText { config, combined_text, page_offsets, current_page, file_path, window_start_abs } => {
                             tokio::spawn(async move {
                                 let res = crate::ai_client::segment_text(&config, &combined_text).await;
-                                let _ = ui_tx.send(UiMessage::SegmentationResult(res));
+                                
+                                let processed_res = match res {
+                                    Ok(chunks) => {
+                                        // 1. Calculate offsets for all chunks in combined_text
+                                        let mut all_segments = Vec::new();
+                                        for chunk in &chunks {
+                                            if let Some((start_idx, end_idx)) = find_approximate_match(&combined_text, chunk) {
+                                                all_segments.push((chunk.clone(), start_idx, end_idx));
+                                            } else {
+                                                // Fallback if not found: map to start of combined_text
+                                                all_segments.push((chunk.clone(), 0, chunk.len()));
+                                            }
+                                        }
+
+                                        // 2. Filter chunks that overlap with current_page
+                                        let page_bound = page_offsets.iter().find(|(p, _, _)| *p == current_page);
+                                        let mut filtered_chunks = Vec::new();
+                                        if let Some((_, page_start, page_end)) = page_bound {
+                                            for (chunk, start_idx, end_idx) in &all_segments {
+                                                if *start_idx < *page_end && *end_idx > *page_start {
+                                                    filtered_chunks.push(chunk.clone());
+                                                }
+                                            }
+                                        } else {
+                                            filtered_chunks = chunks;
+                                        }
+
+                                        Ok(SegmentationSuccess {
+                                            filtered_chunks,
+                                            all_segments,
+                                            page_offsets,
+                                            file_path,
+                                            window_start_abs,
+                                        })
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                
+                                let _ = ui_tx.send(UiMessage::SegmentationResult(processed_res));
                                 ctx.request_repaint();
                             });
                         }
@@ -117,9 +170,14 @@ impl UiApp {
             });
         });
 
+        // Load configuration from local config directories (XDG compliant ~/.config/my_reader/config.json)
+        let config = AppConfig::load();
+        let cache = AppCache::load();
+
         Self {
             reader_state: ReaderState::default(),
-            config: AppConfig::default(),
+            config,
+            cache,
             selected_segment_id: None,
             active_analysis: None,
             tx,
@@ -147,15 +205,80 @@ impl UiApp {
             return;
         }
 
+        // Cache hit optimization: check if page is already fully covered by segments
+        let current_page = self.reader_state.current_page;
+        let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+        if current_page < page_offsets_all.len() {
+            let (page_start, page_end) = page_offsets_all[current_page];
+            let covered_until = self.cache.get_covered_until(&file_path_str, page_start, page_end);
+
+            if covered_until >= page_end {
+                // If not marked as segmented yet, mark it now
+                if !self.cache.is_page_segmented(&file_path_str, current_page) {
+                    self.cache.update_segments(&file_path_str, current_page, page_start, page_end, vec![]);
+                }
+                
+                if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
+                    if !cached_segs.is_empty() {
+                        self.reader_state.segments = cached_segs
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, seg)| DocumentSegment {
+                                id: idx,
+                                text: seg.text,
+                                status: SegmentStatus::Idle,
+                            })
+                            .collect();
+                        self.reader_state.segmentation_loading = false;
+                        self.reader_state.segmentation_error = None;
+                        self.is_segmented = true;
+                        return; // Cached hit! Bypasses network request entirely.
+                    }
+                }
+            }
+        }
+
         self.reader_state.segmentation_loading = true;
         self.reader_state.segmentation_error = None;
         self.reader_state.segments.clear();
 
-        // Get N-1, N, N+1 context window text to send for segmentation
-        let combined_text = self.reader_state.get_sliding_window_context();
+        // Calculate sliding window page indices dynamically (only looking forward for context)
+        let total_pages = self.reader_state.pages.len();
+        let window = self.config.context_window_size;
+        let end_page = if current_page + window < total_pages { current_page + window } else { total_pages - 1 };
+
+        let mut combined_text = String::new();
+        let mut page_offsets = Vec::new();
+
+        // 1. Unsegmented part of the target page
+        let (page_start, _page_end) = page_offsets_all[current_page];
+        let covered_until = self.cache.get_covered_until(&file_path_str, page_start, _page_end);
+        let unsegmented_text = &self.reader_state.pages[current_page][covered_until - page_start..];
+
+        let start_offset = 0;
+        combined_text.push_str(unsegmented_text);
+        let end_offset = combined_text.len();
+        page_offsets.push((current_page, start_offset, end_offset));
+
+        // 2. Succeeding pages for context
+        for p in (current_page + 1)..=end_page {
+            combined_text.push('\n');
+            let start_offset = combined_text.len();
+            combined_text.push_str(&self.reader_state.pages[p]);
+            let end_offset = combined_text.len();
+            page_offsets.push((p, start_offset, end_offset));
+        }
+
         let _ = self.tx.blocking_send(WorkerMessage::SegmentText {
             config: self.config.clone(),
             combined_text,
+            page_offsets,
+            current_page,
+            file_path,
+            window_start_abs: covered_until,
         });
     }
 
@@ -184,8 +307,8 @@ impl UiApp {
                 UiMessage::SegmentationResult(res) => {
                     self.reader_state.segmentation_loading = false;
                     match res {
-                        Ok(chunks) => {
-                            self.reader_state.segments = chunks
+                        Ok(success) => {
+                            self.reader_state.segments = success.filtered_chunks
                                 .into_iter()
                                 .enumerate()
                                 .map(|(id, text)| DocumentSegment {
@@ -197,6 +320,40 @@ impl UiApp {
                             self.selected_segment_id = None;
                             self.active_analysis = None;
                             self.reader_state.segmentation_error = None;
+
+                            // Cache the result persistently
+                            let file_path_str = success.file_path.to_string_lossy().to_string();
+                            if !file_path_str.is_empty() {
+                                let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
+                                let window_pages: Vec<usize> = success.page_offsets.iter().map(|(p, _, _)| *p).collect();
+                                if !window_pages.is_empty() {
+                                    let start_page = window_pages[0];
+                                    let end_page = window_pages[window_pages.len() - 1];
+
+                                    if start_page < page_absolute_offsets.len() && end_page < page_absolute_offsets.len() {
+                                        let window_start_char = success.window_start_abs;
+                                        let window_end_char = page_absolute_offsets[end_page].1;
+                                        let abs_start_offset = success.window_start_abs;
+
+                                        let cached_segs: Vec<crate::cache::CachedSegment> = success.all_segments
+                                            .into_iter()
+                                            .map(|(text, start, end)| crate::cache::CachedSegment {
+                                                text,
+                                                start_offset: abs_start_offset + start,
+                                                end_offset: abs_start_offset + end,
+                                            })
+                                            .collect();
+
+                                        self.cache.update_segments(
+                                            &file_path_str,
+                                            self.reader_state.current_page,
+                                            window_start_char,
+                                            window_end_char,
+                                            cached_segs,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             self.reader_state.segmentation_error = Some(e);
@@ -366,8 +523,20 @@ impl eframe::App for UiApp {
                                 ui.text_edit_singleline(&mut self.config.model);
                                 ui.end_row();
 
+                                ui.label("Phạm vi ngữ cảnh (N ± X):");
+                                egui::ComboBox::new("context_window_select", "")
+                                    .selected_text(format!("Trang N ± {}", self.config.context_window_size))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.config.context_window_size, 1, "Trang N ± 1");
+                                        ui.selectable_value(&mut self.config.context_window_size, 2, "Trang N ± 2");
+                                        ui.selectable_value(&mut self.config.context_window_size, 3, "Trang N ± 3");
+                                        ui.selectable_value(&mut self.config.context_window_size, 4, "Trang N ± 4");
+                                        ui.selectable_value(&mut self.config.context_window_size, 5, "Trang N ± 5");
+                                    });
+                                ui.end_row();
+
                                 ui.label("Ngôn ngữ phản hồi:");
-                                egui::ComboBox::from_label("")
+                                egui::ComboBox::new("language_select", "")
                                     .selected_text(&self.config.language)
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.config.language, "Tiếng Việt".to_string(), "Tiếng Việt");
@@ -391,6 +560,19 @@ impl eframe::App for UiApp {
                     });
                 });
             self.is_config_open = is_config_open && !close_config;
+            
+            // If settings closed, trigger AI segmentation just in case they added key or updated range
+            if self.is_config_open == false && is_config_open == true {
+                // Save config to disk (XDG ~/.config/my_reader/config.json)
+                if let Err(e) = self.config.save() {
+                    self.error_message = Some(format!("Không thể lưu cấu hình: {}", e));
+                }
+                
+                // Only re-segment if we were already in segmented mode
+                if self.is_segmented {
+                    self.trigger_segmentation();
+                }
+            }
         }
 
         // 4. RIGHT SIDE PANEL: AI ANALYSIS SIDEBAR
@@ -585,39 +767,54 @@ impl eframe::App for UiApp {
                                     ui.spinner();
                                     ui.add_space(10.0);
                                     ui.label(
-                                        egui::RichText::new("Đang gửi yêu cầu phân đoạn AI (Sliding Window [N-1, N, N+1])...")
-                                            .weak()
-                                            .size(14.0),
+                                        egui::RichText::new(format!(
+                                            "Đang gửi yêu cầu phân đoạn AI (Sliding Window N ± {})...", 
+                                            self.config.context_window_size
+                                        ))
+                                        .weak()
+                                        .size(14.0),
                                     );
                                 });
                             });
                         } else if let Some(err) = &self.reader_state.segmentation_error {
                             let err_str = err.clone();
-                            ui.centered_and_justified(|ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(239, 68, 68),
-                                        egui::RichText::new("⚠ Lỗi phân đoạn AI:").strong().size(16.0),
-                                    );
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new(&err_str).weak().size(13.0));
-                                    ui.add_space(16.0);
-                                    
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(ui.available_width() * 0.22);
-                                        if ui.button("🔄 Thử lại phân đoạn AI").clicked() {
-                                            retry_segmentation_trigger = true;
-                                        }
-                                        ui.add_space(12.0);
-                                        if ui.button("📄 Dùng phân đoạn mặc định (Local)").clicked() {
-                                            fallback_local_trigger = true;
-                                        }
-                                        ui.add_space(12.0);
-                                        if ui.button("📄 Bản gốc").clicked() {
-                                            show_original_trigger = true;
-                                        }
-                                    });
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(10.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(239, 68, 68),
+                                    egui::RichText::new("⚠ Lỗi phân đoạn AI:").strong().size(16.0),
+                                );
+                                ui.add_space(10.0);
+                                
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    if ui.button("🔄 Thử lại phân đoạn AI").clicked() {
+                                        retry_segmentation_trigger = true;
+                                    }
+                                    ui.add_space(10.0);
+                                    if ui.button("📄 Dùng phân đoạn mặc định (Local)").clicked() {
+                                        fallback_local_trigger = true;
+                                    }
+                                    ui.add_space(10.0);
+                                    if ui.button("📄 Bản gốc").clicked() {
+                                        show_original_trigger = true;
+                                    }
                                 });
+                                ui.add_space(12.0);
+                                
+                                egui::ScrollArea::vertical()
+                                    .max_height(400.0)
+                                    .id_source("segmentation_error_scroll")
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&err_str)
+                                                    .monospace()
+                                                    .color(egui::Color32::from_rgb(239, 68, 68))
+                                            )
+                                            .selectable(true)
+                                        );
+                                    });
                             });
                         } else {
                             egui::ScrollArea::vertical()
@@ -946,6 +1143,10 @@ fn configure_fonts(ctx: &egui::Context) {
         .insert(0, "roboto".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+fn find_approximate_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    crate::ai_client::find_normalized(haystack, needle)
 }
 
 fn main() -> eframe::Result<()> {

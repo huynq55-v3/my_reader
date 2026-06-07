@@ -203,6 +203,19 @@ impl ReaderState {
 
         context
     }
+
+    /// Calculate the absolute start and end byte offsets of all pages in the document
+    pub fn get_page_absolute_offsets(&self) -> Vec<(usize, usize)> {
+        let mut offsets = Vec::with_capacity(self.pages.len());
+        let mut current = 0;
+        for page in &self.pages {
+            let start = current;
+            let end = current + page.len();
+            offsets.push((start, end));
+            current = end + 1; // +1 for '\n'
+        }
+        offsets
+    }
 }
 
 #[cfg(test)]

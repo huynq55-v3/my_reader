@@ -9,10 +9,18 @@ struct ChatMessage {
 }
 
 #[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    format_type: String,
+}
+
+#[derive(Serialize)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Deserialize)]
@@ -33,7 +41,8 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct SegmentItem {
     id: usize,
-    text: String,
+    prefix: String,
+    suffix: String,
 }
 
 #[derive(Deserialize)]
@@ -52,7 +61,7 @@ pub async fn analyze_segment(
     }
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|e| format!("Không thể tạo HTTP client: {}", e))?;
 
@@ -92,21 +101,59 @@ pub async fn analyze_segment(
             },
         ],
         temperature: 0.2,
+        response_format: None,
+    };
+
+    let masked_key = if config.api_key.len() > 8 {
+        format!("{}...{}", &config.api_key[..4], &config.api_key[config.api_key.len()-4..])
+    } else {
+        "***".to_string()
     };
 
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.api_key))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Lỗi gửi yêu cầu đến API: {}", e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi gửi yêu cầu phân tích đến API: {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - Error: {:?}",
+                e, url, config.model, masked_key, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
 
     let status = response.status();
-    let body_text = response
-        .text()
+    let headers = response.headers().clone();
+
+    // Read response as raw bytes to prevent decoding issues (e.g. gzip compression or non-UTF-8 characters)
+    let bytes = response
+        .bytes()
         .await
-        .map_err(|e| format!("Lỗi đọc phản hồi từ API: {}", e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi nhận bytes phản hồi phân tích từ API (Status: {}): {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - Response Headers: {:?}\n\
+                - Error: {:?}",
+                status, e, url, config.model, masked_key, headers, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
+
+    let body_text = String::from_utf8_lossy(&bytes).into_owned();
 
     if !status.is_success() {
         if let Ok(json_err) = serde_json::from_str::<serde_json::Value>(&body_text) {
@@ -114,11 +161,34 @@ pub async fn analyze_segment(
                 return Err(format!("API Error ({}): {}", status, err_msg));
             }
         }
-        return Err(format!("API Error ({}): {}", status, body_text));
+        return Err(format!(
+            "API Error ({}):\n{}\n\
+            [DEBUG INFO]\n\
+            - URL: {}\n\
+            - Model: {}\n\
+            - API Key: {}\n\
+            - Headers: {:?}",
+            status, body_text, url, config.model, masked_key, headers
+        ));
     }
 
     let response_data: ChatCompletionResponse = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Lỗi parse dữ liệu JSON từ API ({}): {}", e, body_text))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi parse dữ liệu JSON từ API: {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - HTTP Status: {}\n\
+                - Response Headers: {:?}\n\
+                - Body thô:\n{}\n\
+                - Error: {:?}",
+                e, url, config.model, masked_key, status, headers, body_text, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
 
     if response_data.choices.is_empty() {
         return Err("API không trả về bất kỳ kết quả phân tích nào.".to_string());
@@ -127,7 +197,8 @@ pub async fn analyze_segment(
     Ok(response_data.choices[0].message.content.clone())
 }
 
-/// Send request to OpenAI/DeepSeek compatible API to segment a given text using JSON structured output
+/// Send request to OpenAI/DeepSeek compatible API to segment a given text using JSON structured output.
+/// Employs a 3-word prefix/suffix token saving optimization mechanism.
 pub async fn segment_text(
     config: &AppConfig,
     combined_text: &str,
@@ -137,7 +208,7 @@ pub async fn segment_text(
     }
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|e| format!("Không thể tạo HTTP client: {}", e))?;
 
@@ -149,15 +220,26 @@ pub async fn segment_text(
 
     let system_prompt = "Bạn là một trợ lý AI chuyên nghiệp phân tích cấu trúc văn bản. \
         Nhiệm vụ của bạn là phân mảnh (segment) nội dung văn bản được cung cấp thành các đoạn thông tin logic, mạch lạc (Document Segments). \
-        Hãy gộp các câu hoặc dòng có cùng chủ đề hoặc logic liền mạch thành một segment. \
+        Để tối ưu hóa tốc độ và giảm thiểu token phản hồi từ LLM, bạn KHÔNG cần viết lại toàn bộ nội dung của các phân đoạn. \
+        Thay vào đó, với mỗi phân đoạn, bạn chỉ cần cung cấp đúng 3 TỪ đầu tiên (trường 'prefix') và 3 TỪ cuối cùng (trường 'suffix') của phân đoạn đó. \
+        \
+        YÊU CẦU ĐỘ DÀI: Mỗi phân đoạn có độ dài tối đa là 1 đoạn văn (paragraph). Nếu gặp ranh giới đoạn văn (kết thúc đoạn văn / xuống dòng mới), \
+        bạn BẮT BUỘC phải kết thúc phân đoạn đó và bắt đầu phân đoạn mới. Tuyệt đối không gộp nhiều đoạn văn lại thành một phân đoạn. \
+        \
+        QUAN TRỌNG: Nếu một đoạn văn bị cắt đôi do ranh giới trang (cuối trang trước và đầu trang sau), bạn PHẢI ghép nối chúng lại thành một phân đoạn duy nhất hoàn chỉnh và liền mạch: \
+        lấy 3 từ đầu của phần ở cuối trang trước làm 'prefix', và 3 từ cuối của phần ở đầu trang sau làm 'suffix' (bỏ các tiêu đề/chân trang phân tách ở giữa). \
+        \
+        Ví dụ: Với phân đoạn 'Văn học là nhân học rất tuyệt vời', prefix sẽ là 'Văn học là' và suffix sẽ là 'rất tuyệt vời'. \
+        Hãy đảm bảo lấy chính xác các từ từ văn bản gốc (giữ nguyên dấu câu, hoa thường). \
+        \
         Bạn PHẢI trả về kết quả dưới dạng JSON có cấu trúc chính xác theo schema sau:\n\
         {\n\
           \"segments\": [\n\
-            { \"id\": 1, \"text\": \"Nội dung thô của phân đoạn 1\" },\n\
+            { \"id\": 1, \"prefix\": \"3 từ đầu của phân đoạn 1\", \"suffix\": \"3 từ cuối của phân đoạn 1\" },\n\
             ...\n\
           ]\n\
         }\n\
-        Hãy đảm bảo giá trị của trường 'text' là chính xác các phần trích xuất từ văn bản đầu vào. Không thêm bất kỳ chữ nào ngoài JSON block."
+        Không thêm bất kỳ chữ nào ngoài JSON block."
         .to_string();
 
     let payload = ChatCompletionRequest {
@@ -173,33 +255,100 @@ pub async fn segment_text(
             },
         ],
         temperature: 0.2,
+        response_format: Some(ResponseFormat {
+            format_type: "json_object".to_string(),
+        }),
+    };
+
+    let masked_key = if config.api_key.len() > 8 {
+        format!("{}...{}", &config.api_key[..4], &config.api_key[config.api_key.len()-4..])
+    } else {
+        "***".to_string()
     };
 
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.api_key))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Lỗi gửi yêu cầu phân đoạn: {}", e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi gửi yêu cầu phân đoạn: {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - Error: {:?}",
+                e, url, config.model, masked_key, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
 
     let status = response.status();
-    let body_text = response
-        .text()
+    let headers = response.headers().clone();
+
+    // Read response as raw bytes to prevent decoding issues (e.g. gzip compression or non-UTF-8 characters)
+    let bytes = response
+        .bytes()
         .await
-        .map_err(|e| format!("Lỗi đọc phản hồi từ API: {}", e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi nhận bytes phân đoạn từ API (Status: {}): {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - Response Headers: {:?}\n\
+                - Error: {:?}",
+                status, e, url, config.model, masked_key, headers, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
+
+    let body_text = String::from_utf8_lossy(&bytes).into_owned();
 
     if !status.is_success() {
+        eprintln!("[DEBUG] HTTP Error Status (Segment): {}", status);
+        eprintln!("[DEBUG] HTTP Error Headers (Segment): {:?}", headers);
+        eprintln!("[DEBUG] HTTP Error Body (Segment): {}", body_text);
+
         if let Ok(json_err) = serde_json::from_str::<serde_json::Value>(&body_text) {
             if let Some(err_msg) = json_err["error"]["message"].as_str() {
                 return Err(format!("API Error ({}): {}", status, err_msg));
             }
         }
-        return Err(format!("API Error ({}): {}", status, body_text));
+        return Err(format!(
+            "API Error ({}):\n{}\n\
+            [DEBUG INFO]\n\
+            - URL: {}\n\
+            - Model: {}\n\
+            - API Key: {}\n\
+            - Headers: {:?}",
+            status, body_text, url, config.model, masked_key, headers
+        ));
     }
 
     let response_data: ChatCompletionResponse = serde_json::from_str(&body_text)
-        .map_err(|e| format!("Lỗi parse dữ liệu JSON từ API: {}", e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Lỗi parse dữ liệu JSON từ API phân đoạn: {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - HTTP Status: {}\n\
+                - Response Headers: {:?}\n\
+                - Body thô:\n{}\n\
+                - Error: {:?}",
+                e, url, config.model, masked_key, status, headers, body_text, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
 
     if response_data.choices.is_empty() {
         return Err("API không trả về kết quả phân đoạn.".to_string());
@@ -219,13 +368,179 @@ pub async fn segment_text(
     }
     let json_str = json_str.trim();
 
-    // Deserialize
+    // Deserialize prefix/suffix metadata
     let parsed: SegmentationResponseJson = serde_json::from_str(json_str)
-        .map_err(|e| format!("Không thể phân tích cấu trúc JSON phân đoạn. Phản hồi thô của AI:\n{}\n\nLỗi: {}", content_text, e))?;
+        .map_err(|e| {
+            let err_msg = format!(
+                "Không thể phân tích cấu trúc JSON phân đoạn: {}\n\
+                [DEBUG INFO]\n\
+                - URL: {}\n\
+                - Model: {}\n\
+                - API Key: {}\n\
+                - HTTP Status: {}\n\
+                - Phản hồi thô của AI:\n{}\n\
+                - JSON trích xuất:\n{}\n\
+                - Error: {:?}",
+                e, url, config.model, masked_key, status, content_text, json_str, e
+            );
+            eprintln!("{}", err_msg);
+            err_msg
+        })?;
 
-    let mut segments = parsed.segments;
-    segments.sort_by_key(|s| s.id);
+    let mut items = parsed.segments;
+    items.sort_by_key(|s| s.id);
 
-    let result = segments.into_iter().map(|s| s.text).collect();
-    Ok(result)
+    // Reconstruct full text chunks from 3-word prefixes and suffixes sequentially
+    let mut reconstructed_chunks = Vec::new();
+    let mut current_pos = 0;
+    let num_items = items.len();
+
+    for i in 0..num_items {
+        let item = &items[i];
+        let prefix = &item.prefix;
+        let suffix = &item.suffix;
+
+        if prefix.is_empty() || suffix.is_empty() {
+            continue;
+        }
+
+        // Find start of current segment
+        let start_idx = if let Some((start, _)) = find_normalized(&combined_text[current_pos..], prefix) {
+            current_pos + start
+        } else {
+            current_pos
+        };
+
+        // Find start of next segment to bound our suffix search space
+        let next_start_idx = if i + 1 < num_items {
+            let next_prefix = &items[i + 1].prefix;
+            if !next_prefix.is_empty() {
+                if let Some((next_start, _)) = find_normalized(&combined_text[start_idx + prefix.len()..], next_prefix) {
+                    start_idx + prefix.len() + next_start
+                } else {
+                    combined_text.len()
+                }
+            } else {
+                combined_text.len()
+            }
+        } else {
+            combined_text.len()
+        };
+
+        // Look for suffix in the range [start_idx + prefix.len() .. next_start_idx]
+        let mut end_idx = next_start_idx;
+        if start_idx + prefix.len() < next_start_idx {
+            let search_range = &combined_text[start_idx + prefix.len()..next_start_idx];
+            if let Some((_, suffix_end)) = find_normalized(search_range, suffix) {
+                end_idx = start_idx + prefix.len() + suffix_end;
+            }
+        }
+
+        // Extract segment text
+        let segment_text = combined_text[start_idx..end_idx].trim().to_string();
+        if !segment_text.is_empty() {
+            reconstructed_chunks.push(segment_text);
+        }
+        
+        current_pos = end_idx;
+    }
+
+    Ok(reconstructed_chunks)
 }
+
+/// Whitespace-insensitive matching to find the start and end byte indices of a needle within a haystack.
+pub fn find_normalized(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_tokens: Vec<String> = needle
+        .split_whitespace()
+        .map(|w| normalize_token(w))
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    if needle_tokens.is_empty() {
+        return None;
+    }
+
+    // Tokenize haystack with byte indices
+    let mut haystack_tokens = Vec::new();
+    let mut current_token_start = None;
+
+    for (byte_idx, ch) in haystack.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = current_token_start {
+                let end = byte_idx;
+                let word = &haystack[start..end];
+                haystack_tokens.push((start, end, normalize_token(word)));
+                current_token_start = None;
+            }
+        } else if current_token_start.is_none() {
+            current_token_start = Some(byte_idx);
+        }
+    }
+    if let Some(start) = current_token_start {
+        let end = haystack.len();
+        let word = &haystack[start..end];
+        haystack_tokens.push((start, end, normalize_token(word)));
+    }
+
+    if haystack_tokens.len() < needle_tokens.len() {
+        return None;
+    }
+
+    // Slide a window of size `needle_tokens.len()` over `haystack_tokens`
+    let window_size = needle_tokens.len();
+    for i in 0..=(haystack_tokens.len() - window_size) {
+        let mut matches = true;
+        for j in 0..window_size {
+            if haystack_tokens[i + j].2 != needle_tokens[j] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            let start_byte = haystack_tokens[i].0;
+            let end_byte = haystack_tokens[i + window_size - 1].1;
+            return Some((start_byte, end_byte));
+        }
+    }
+
+    // Fallback: whitespace-insensitive substring search mapping
+    let clean_haystack: String = haystack.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+    let clean_needle: String = needle.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+    if let Some(idx) = clean_haystack.find(&clean_needle) {
+        let mut h_chars = haystack.char_indices().peekable();
+        let mut clean_idx = 0;
+        let mut start_byte = None;
+        let mut end_byte = None;
+
+        while let Some(&(b_idx, ch)) = h_chars.peek() {
+            if ch.is_whitespace() {
+                h_chars.next();
+                continue;
+            }
+            if clean_idx == idx {
+                start_byte = Some(b_idx);
+            }
+            if clean_idx == idx + clean_needle.chars().count() - 1 {
+                end_byte = Some(b_idx + ch.len_utf8());
+                break;
+            }
+            clean_idx += 1;
+            h_chars.next();
+        }
+
+        if let (Some(s), Some(e)) = (start_byte, end_byte) {
+            return Some((s, e));
+        }
+    }
+
+    None
+}
+
+fn normalize_token(token: &str) -> String {
+    token
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
