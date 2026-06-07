@@ -1,5 +1,21 @@
 use std::path::{Path, PathBuf};
-use lopdf::Document as PdfDocument;
+// We no longer use lopdf for page parsing since we use pdftotext, but Cargo.toml maintains it for compatibility.
+
+#[derive(Clone, Debug, Default)]
+pub struct PageLayout {
+    pub width: f32,
+    pub height: f32,
+    pub words: Vec<WordBbox>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WordBbox {
+    pub text: String,
+    pub x_min: f32,
+    pub y_min: f32,
+    pub x_max: f32,
+    pub y_max: f32,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SegmentStatus {
@@ -68,27 +84,34 @@ impl ReaderState {
         Ok(state)
     }
 
-    /// Load PDF file page by page using lopdf, guaranteeing correct order of pages
+    /// Load PDF file page by page using pdftotext tool, guaranteeing correct order and robustness
     fn load_pdf(path: &Path) -> Result<Vec<String>, String> {
-        let doc = PdfDocument::load(path)
-            .map_err(|e| format!("Không thể mở file PDF: {}", e))?;
+        let output = std::process::Command::new("pdftotext")
+            .arg(path)
+            .arg("-")
+            .output()
+            .map_err(|e| format!("Không thể chạy pdftotext: {}", e))?;
 
-        let pages_dict = doc.get_pages();
-        let mut page_numbers: Vec<u32> = pages_dict.keys().cloned().collect();
-        page_numbers.sort();
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Lỗi trích xuất văn bản PDF: {}", err_msg));
+        }
 
-        let mut pages = Vec::with_capacity(page_numbers.len());
+        let content = String::from_utf8_lossy(&output.stdout);
+        
+        // Split by form feed (\x0c) which pdftotext inserts between pages
+        let mut pages = content
+            .split('\x0c')
+            .map(|p| p.trim().to_string())
+            .collect::<Vec<_>>();
 
-        for page_num in page_numbers {
-            // lopdf extract_text takes 1-based page numbers
-            match doc.extract_text(&[page_num]) {
-                Ok(text) => {
-                    pages.push(text);
-                }
-                Err(_) => {
-                    pages.push(format!("[Lỗi trích xuất trang {}]", page_num));
-                }
-            }
+        // Remove trailing empty page if pdftotext added a trailing form feed
+        if pages.len() > 1 && pages.last().unwrap().is_empty() {
+            pages.pop();
+        }
+
+        if pages.is_empty() {
+            return Err("Tài liệu trống hoặc không thể đọc được nội dung.".to_string());
         }
 
         Ok(pages)
@@ -254,4 +277,141 @@ mod tests {
         
         let _ = std::fs::remove_file(file_path);
     }
+
+    #[test]
+    fn test_load_real_pdf() {
+        let path = Path::new("/home/huy/Documents/emperor_new_mind.pdf");
+        if path.exists() {
+            let state = ReaderState::load_file(path).unwrap();
+            assert_eq!(state.pages.len(), 1023);
+            assert!(state.pages[9].contains("Mclntyre"));
+        }
+    }
+
+    #[test]
+    fn test_bbox_parsing_real_pdf() {
+        let path = Path::new("/home/huy/Documents/emperor_new_mind.pdf");
+        if path.exists() {
+            let output = std::process::Command::new("pdftotext")
+                .arg("-f")
+                .arg("10")
+                .arg("-l")
+                .arg("10")
+                .arg("-bbox")
+                .arg(path)
+                .arg("-")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let html = String::from_utf8_lossy(&output.stdout);
+            let layout = parse_bbox_html(&html).unwrap();
+            assert!(layout.width > 0.0);
+            assert!(layout.height > 0.0);
+            assert!(!layout.words.is_empty());
+            assert!(layout.words.iter().any(|w| w.text.contains("Mclntyre")));
+        }
+    }
+}
+
+pub fn parse_bbox_html(html: &str) -> Option<PageLayout> {
+    // 1. Parse page width and height
+    // E.g. <page width="612.000000" height="792.000000">
+    let page_re = regex::Regex::new(r#"<page\s+width="([\d.]+)"\s+height="([\d.]+)""#).ok()?;
+    let caps = page_re.captures(html)?;
+    let width = caps.get(1)?.as_str().parse::<f32>().ok()?;
+    let height = caps.get(2)?.as_str().parse::<f32>().ok()?;
+
+    // 2. Parse words
+    // E.g. <word xMin="280.847156" yMin="493.555644" xMax="344.392076" yMax="518.091775">Mclntyre,</word>
+    let word_re = regex::Regex::new(
+        r#"<word\s+xMin="([\d.]+)"\s+yMin="([\d.]+)"\s+xMax="([\d.]+)"\s+yMax="([\d.]+)">([^<]*)</word>"#
+    ).ok()?;
+
+    let mut words = Vec::new();
+    for caps in word_re.captures_iter(html) {
+        let x_min = caps.get(1).unwrap().as_str().parse::<f32>().unwrap_or(0.0);
+        let y_min = caps.get(2).unwrap().as_str().parse::<f32>().unwrap_or(0.0);
+        let x_max = caps.get(3).unwrap().as_str().parse::<f32>().unwrap_or(0.0);
+        let y_max = caps.get(4).unwrap().as_str().parse::<f32>().unwrap_or(0.0);
+        let text = caps.get(5).unwrap().as_str().to_string();
+        
+        words.push(WordBbox {
+            text,
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        });
+    }
+
+    Some(PageLayout {
+        width,
+        height,
+        words,
+    })
+}
+
+fn normalize_word(w: &str) -> String {
+    w.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+pub fn find_segment_words(
+    page_words: &[WordBbox],
+    segment_text: &str,
+) -> Vec<usize> {
+    let segment_words: Vec<String> = segment_text
+        .split_whitespace()
+        .map(normalize_word)
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    if segment_words.is_empty() {
+        return Vec::new();
+    }
+
+    let page_words_normalized: Vec<String> = page_words
+        .iter()
+        .map(|w| normalize_word(&w.text))
+        .collect();
+
+    let mut matched_indices = Vec::new();
+    let n = page_words_normalized.len();
+    let m = segment_words.len();
+    
+    if n < m {
+        return Vec::new();
+    }
+
+    let mut best_start = 0;
+    let mut best_count = 0;
+
+    for i in 0..=(n - m) {
+        let mut count = 0;
+        for j in 0..m {
+            if page_words_normalized[i + j] == segment_words[j] {
+                count += 1;
+            }
+        }
+        if count > best_count {
+            best_count = count;
+            best_start = i;
+        }
+        if count == m {
+            for k in 0..m {
+                matched_indices.push(i + k);
+            }
+            return matched_indices;
+        }
+    }
+
+    if best_count > m / 2 {
+        for k in 0..m {
+            matched_indices.push(best_start + k);
+        }
+    }
+
+    matched_indices
 }

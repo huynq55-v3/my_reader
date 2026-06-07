@@ -33,12 +33,31 @@ pub enum WorkerMessage {
         target_text: String,
         segment_id: usize,
     },
+    RenderPage {
+        file_path: PathBuf,
+        page_index: usize,
+    },
 }
 
 pub enum UiMessage {
     FileLoaded(Result<ReaderState, String>),
     SegmentationResult(Result<SegmentationSuccess, String>),
     AnalysisResult(usize, Result<String, String>),
+    PageRendered {
+        page_index: usize,
+        color_image: egui::ColorImage,
+        layout: crate::document::PageLayout,
+    },
+    PageRenderError {
+        page_index: usize,
+        error: String,
+    },
+}
+
+pub struct RenderedPageData {
+    pub page_index: usize,
+    pub texture: egui::TextureHandle,
+    pub layout: crate::document::PageLayout,
 }
 
 pub struct UiApp {
@@ -57,6 +76,12 @@ pub struct UiApp {
     page_jump_text: String,
     hovered_segment_id: Option<usize>,
     is_segmented: bool,
+
+    // Visual PDF view state
+    visual_view: bool,
+    rendered_page_data: Option<RenderedPageData>,
+    rendering_page_index: Option<usize>,
+    page_render_error: Option<String>,
 }
 
 impl UiApp {
@@ -165,6 +190,27 @@ impl UiApp {
                                 ctx.request_repaint();
                             });
                         }
+                        WorkerMessage::RenderPage { file_path, page_index } => {
+                            tokio::spawn(async move {
+                                let res = render_pdf_page_task(&file_path, page_index).await;
+                                match res {
+                                    Ok((color_image, layout)) => {
+                                        let _ = ui_tx.send(UiMessage::PageRendered {
+                                            page_index,
+                                            color_image,
+                                            layout,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = ui_tx.send(UiMessage::PageRenderError {
+                                            page_index,
+                                            error: e,
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
                     }
                 }
             });
@@ -188,6 +234,10 @@ impl UiApp {
             page_jump_text: String::new(),
             hovered_segment_id: None,
             is_segmented: false,
+            visual_view: true,
+            rendered_page_data: None,
+            rendering_page_index: None,
+            page_render_error: None,
         }
     }
 
@@ -195,6 +245,10 @@ impl UiApp {
     /// If so, load the cached segments immediately and enter segmented view.
     /// Otherwise, reset the page to the normal unsegmented text view.
     fn check_cache_or_reset(&mut self) {
+        self.rendered_page_data = None;
+        self.page_render_error = None;
+        self.rendering_page_index = None;
+
         if self.reader_state.pages.is_empty() {
             return;
         }
@@ -331,7 +385,7 @@ impl UiApp {
     }
 
     /// Process messages from the background worker
-    fn poll_messages(&mut self) {
+    fn poll_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 UiMessage::FileLoaded(res) => {
@@ -469,6 +523,32 @@ impl UiApp {
                         }
                     }
                 }
+                UiMessage::PageRendered { page_index, color_image, layout } => {
+                    if self.reader_state.current_page == page_index {
+                        let texture = ctx.load_texture(
+                            format!("pdf_page_{}", page_index),
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
+                        self.rendered_page_data = Some(RenderedPageData {
+                            page_index,
+                            texture,
+                            layout,
+                        });
+                        self.page_render_error = None;
+                    }
+                    if self.rendering_page_index == Some(page_index) {
+                        self.rendering_page_index = None;
+                    }
+                }
+                UiMessage::PageRenderError { page_index, error } => {
+                    if self.reader_state.current_page == page_index {
+                        self.page_render_error = Some(error);
+                    }
+                    if self.rendering_page_index == Some(page_index) {
+                        self.rendering_page_index = None;
+                    }
+                }
             }
         }
     }
@@ -476,7 +556,7 @@ impl UiApp {
 
 impl eframe::App for UiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_messages();
+        self.poll_messages(ctx);
 
         // 1. TOP CONTROL PANEL
         egui::TopBottomPanel::top("control_panel")
@@ -784,23 +864,50 @@ impl eframe::App for UiApp {
                             }
                         });
                     });
-                } else if !self.is_segmented {
-                    // Normal non-segmented page text viewer mode
+                } else {
+                    let is_pdf = self.reader_state.file_path.as_ref()
+                        .map(|p| p.extension().map(|e| e.to_string_lossy().to_lowercase() == "pdf").unwrap_or(false))
+                        .unwrap_or(false);
+
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.heading(
-                                egui::RichText::new(format!("Trang {} / {}", self.reader_state.current_page + 1, self.reader_state.pages.len()))
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
+                                egui::RichText::new(format!(
+                                    "Trang {} / {}",
+                                    self.reader_state.current_page + 1,
+                                    self.reader_state.pages.len()
+                                ))
+                                .strong()
+                                .color(egui::Color32::WHITE),
                             );
+
+                            if is_pdf {
+                                ui.separator();
+                                ui.checkbox(&mut self.visual_view, "🖼 Xem Trang Gốc (PDF Visual)");
+                            }
+
                             ui.separator();
-                            
-                            // Primary button to trigger AI segmentation on demand
-                            if ui.add(egui::Button::new("⚡ Phân đoạn AI (Segment)").min_size(egui::vec2(130.0, 26.0)))
-                                .on_hover_text("Sử dụng AI để chia trang này thành các phân đoạn thông tin nhỏ")
-                                .clicked()
-                            {
-                                retry_segmentation_trigger = true;
+
+                            if !self.is_segmented {
+                                // Primary button to trigger AI segmentation on demand
+                                if ui.add(egui::Button::new("⚡ Phân đoạn AI (Segment)").min_size(egui::vec2(130.0, 26.0)))
+                                    .on_hover_text("Sử dụng AI để chia trang này thành các phân đoạn thông tin nhỏ")
+                                    .clicked()
+                                {
+                                    retry_segmentation_trigger = true;
+                                }
+                            } else {
+                                if !is_pdf || !self.visual_view {
+                                    ui.label(egui::RichText::new("Nhấp vào bất kỳ đoạn văn nào bên dưới để AI phân tích ngữ cảnh.").weak());
+                                } else {
+                                    ui.label(egui::RichText::new("Nhấp chọn phân đoạn trực tiếp trên ảnh PDF để xem phân tích.").weak());
+                                }
+                                
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("📄 Bản gốc (Original)").on_hover_text("Quay lại chế độ xem tài liệu thông thường").clicked() {
+                                        show_original_trigger = true;
+                                    }
+                                });
                             }
                         });
                         
@@ -808,247 +915,229 @@ impl eframe::App for UiApp {
                         ui.separator();
                         ui.add_space(10.0);
 
-                        egui::ScrollArea::vertical()
-                            .id_source("document_scroll")
-                            .show(ui, |ui| {
-                                let page_text = &self.reader_state.pages[self.reader_state.current_page];
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(page_text)
-                                            .size(15.0)
-                                            .line_height(Some(22.0))
-                                            .color(egui::Color32::from_rgb(228, 228, 231)),
-                                    ),
-                                );
-                                ui.add_space(20.0);
-                            });
-                    });
-                } else {
-                    // Segmented interactive mode
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading(
-                                egui::RichText::new(format!("Trang {} / {}", self.reader_state.current_page + 1, self.reader_state.pages.len()))
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.separator();
-                            ui.label(egui::RichText::new("Nhấp vào bất kỳ đoạn văn nào bên dưới để AI phân tích ngữ cảnh.").weak());
-                            
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("📄 Bản gốc (Original)").on_hover_text("Quay lại chế độ xem tài liệu thông thường").clicked() {
-                                    show_original_trigger = true;
-                                }
-                            });
-                        });
-                        
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-
-                        if self.reader_state.segmentation_loading {
-                            ui.centered_and_justified(|ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.spinner();
-                                    ui.add_space(10.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Đang gửi yêu cầu phân đoạn AI (Sliding Window N ± {})...", 
-                                            self.config.context_window_size
-                                        ))
-                                        .weak()
-                                        .size(14.0),
-                                    );
-                                });
-                            });
-                        } else if let Some(err) = &self.reader_state.segmentation_error {
-                            let err_str = err.clone();
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(10.0);
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(239, 68, 68),
-                                    egui::RichText::new("⚠ Lỗi phân đoạn AI:").strong().size(16.0),
-                                );
-                                ui.add_space(10.0);
-                                
-                                ui.horizontal(|ui| {
-                                    ui.add_space(10.0);
-                                    if ui.button("🔄 Thử lại phân đoạn AI").clicked() {
-                                        retry_segmentation_trigger = true;
-                                    }
-                                    ui.add_space(10.0);
-                                    if ui.button("📄 Dùng phân đoạn mặc định (Local)").clicked() {
-                                        fallback_local_trigger = true;
-                                    }
-                                    ui.add_space(10.0);
-                                    if ui.button("📄 Bản gốc").clicked() {
-                                        show_original_trigger = true;
-                                    }
-                                });
-                                ui.add_space(12.0);
-                                
-                                egui::ScrollArea::vertical()
-                                    .max_height(400.0)
-                                    .id_source("segmentation_error_scroll")
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&err_str)
-                                                    .monospace()
-                                                    .color(egui::Color32::from_rgb(239, 68, 68))
-                                            )
-                                            .selectable(true)
-                                        );
-                                    });
-                            });
-                        } else {
+                        if is_pdf && self.visual_view {
+                            self.render_visual_pdf_view(ui, ctx);
+                        } else if !self.is_segmented {
+                            // Normal non-segmented page text viewer mode
                             egui::ScrollArea::vertical()
                                 .id_source("document_scroll")
                                 .show(ui, |ui| {
-                                    // Draw segments of the current page
-                                    for idx in 0..self.reader_state.segments.len() {
-                                        let segment = &self.reader_state.segments[idx];
-                                        let is_selected = self.selected_segment_id == Some(segment.id);
-                                        let is_hovered = self.hovered_segment_id == Some(segment.id);
-
-                                        // Styling colors based on interaction state
-                                        // IF SELECTED: Bôi vàng! Yellow background and dark text for high visibility
-                                        let fill = if is_selected {
-                                            egui::Color32::from_rgb(254, 240, 138) // Tailwind yellow-300 (#fef08a)
-                                        } else if is_hovered {
-                                            egui::Color32::from_rgb(24, 24, 27) // Lighter dark for hovered
-                                        } else {
-                                            egui::Color32::from_rgb(16, 16, 18) // Base dark card color
-                                        };
-
-                                        let stroke = if is_selected {
-                                            egui::Stroke::new(1.8, egui::Color32::from_rgb(234, 179, 8)) // Accent yellow border
-                                        } else if is_hovered {
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(63, 63, 70)) // Subtle border on hover
-                                        } else {
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 39, 42)) // Standard dark border
-                                        };
-
-                                        let frame = egui::Frame::none()
-                                            .fill(fill)
-                                            .stroke(stroke)
-                                            .rounding(6.0)
-                                            .inner_margin(12.0)
-                                            .outer_margin(egui::Margin::symmetric(0.0, 4.0));
-
-                                        let response = frame.show(ui, |ui| {
-                                            ui.vertical(|ui| {
-                                                ui.horizontal(|ui| {
-                                                    match &segment.status {
-                                                        SegmentStatus::Idle => {
-                                                            ui.label(
-                                                                egui::RichText::new(format!("Đoạn #{}", segment.id + 1))
-                                                                    .size(11.0)
-                                                                    .strong()
-                                                                    .color(if is_selected {
-                                                                        egui::Color32::from_rgb(113, 63, 4) // Darker brown-yellow
-                                                                    } else {
-                                                                        egui::Color32::from_rgb(113, 113, 122)
-                                                                    }),
-                                                            );
-                                                        }
-                                                        SegmentStatus::Loading => {
-                                                            ui.spinner();
-                                                            ui.colored_label(
-                                                                if is_selected {
-                                                                    egui::Color32::from_rgb(180, 83, 9)
-                                                                } else {
-                                                                    egui::Color32::from_rgb(245, 158, 11)
-                                                                },
-                                                                "Đang phân tích..."
-                                                            );
-                                                        }
-                                                        SegmentStatus::Analyzed(_) => {
-                                                            ui.colored_label(
-                                                                if is_selected {
-                                                                    egui::Color32::from_rgb(21, 128, 61)
-                                                                } else {
-                                                                    egui::Color32::from_rgb(16, 185, 129)
-                                                                },
-                                                                "✓ Đã phân tích"
-                                                            );
-                                                        }
-                                                        SegmentStatus::Error(_) => {
-                                                            ui.colored_label(
-                                                                if is_selected {
-                                                                    egui::Color32::from_rgb(185, 28, 28)
-                                                                } else {
-                                                                    egui::Color32::from_rgb(239, 68, 68)
-                                                                },
-                                                                "⚠ Gặp lỗi"
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                                
-                                                ui.add_space(6.0);
-                                                
-                                                // High contrast text inside yellow selection frame
-                                                let text_color = if is_selected {
-                                                    egui::Color32::from_rgb(28, 25, 23) // Stone-900 (Dark)
-                                                } else {
-                                                    egui::Color32::from_rgb(228, 228, 231) // Zinc-200 (Light)
-                                                };
-
-                                                ui.label(
-                                                    egui::RichText::new(&segment.text)
-                                                        .size(14.5)
-                                                        .line_height(Some(20.0))
-                                                        .color(text_color),
-                                                );
-                                            });
-                                        }).response;
-
-                                        let click_response = ui.interact(response.rect, response.id, egui::Sense::click());
-                                        
-                                        // Update hover status for the next frame
-                                        if click_response.hovered() {
-                                            next_hovered_id = Some(segment.id);
+                                    let page_text = &self.reader_state.pages[self.reader_state.current_page];
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(page_text)
+                                                .size(15.0)
+                                                .line_height(Some(22.0))
+                                                .color(egui::Color32::from_rgb(228, 228, 231)),
+                                        ),
+                                    );
+                                    ui.add_space(20.0);
+                                });
+                        } else {
+                            // Segmented interactive mode
+                            if self.reader_state.segmentation_loading {
+                                ui.centered_and_justified(|ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.spinner();
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Đang gửi yêu cầu phân đoạn AI (Sliding Window N ± {})...", 
+                                                self.config.context_window_size
+                                            ))
+                                            .weak()
+                                            .size(14.0),
+                                        );
+                                    });
+                                });
+                            } else if let Some(err) = &self.reader_state.segmentation_error {
+                                let err_str = err.clone();
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(239, 68, 68),
+                                        egui::RichText::new("⚠ Lỗi phân đoạn AI:").strong().size(16.0),
+                                    );
+                                    ui.add_space(10.0);
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(10.0);
+                                        if ui.button("🔄 Thử lại phân đoạn AI").clicked() {
+                                            retry_segmentation_trigger = true;
                                         }
+                                        ui.add_space(10.0);
+                                        if ui.button("📄 Dùng phân đoạn mặc định (Local)").clicked() {
+                                            fallback_local_trigger = true;
+                                        }
+                                        ui.add_space(10.0);
+                                        if ui.button("📄 Bản gốc").clicked() {
+                                            show_original_trigger = true;
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+                                    
+                                    egui::ScrollArea::vertical()
+                                        .max_height(400.0)
+                                        .id_source("segmentation_error_scroll")
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&err_str)
+                                                        .monospace()
+                                                        .color(egui::Color32::from_rgb(239, 68, 68))
+                                                )
+                                                .selectable(true)
+                                            );
+                                        });
+                                });
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_source("document_scroll")
+                                    .show(ui, |ui| {
+                                        // Draw segments of the current page
+                                        for idx in 0..self.reader_state.segments.len() {
+                                            let segment = &self.reader_state.segments[idx];
+                                            let is_selected = self.selected_segment_id == Some(segment.id);
+                                            let is_hovered = self.hovered_segment_id == Some(segment.id);
 
-                                        if click_response.clicked() {
-                                            self.selected_segment_id = Some(segment.id);
-                                            
-                                            let status = segment.status.clone();
-                                            let segment_id = segment.id;
-                                            
-                                            match &status {
-                                                SegmentStatus::Analyzed(analysis) => {
-                                                    self.active_analysis = Some(analysis.clone());
-                                                }
-                                                SegmentStatus::Error(e) => {
-                                                    self.active_analysis = Some(format!("Lỗi trước đó: {}", e));
-                                                }
-                                                SegmentStatus::Loading => {
-                                                    self.active_analysis = Some("Đang tải dữ liệu...".to_string());
-                                                }
-                                                SegmentStatus::Idle => {
-                                                    // 1. Get Context and Target Text *before* borrowing mutable reference to segment
-                                                    let context = self.reader_state.get_sliding_window_context();
-                                                    let target_text = self.reader_state.segments[idx].text.clone();
-                                                    
-                                                    // 2. Perform mutable borrows of the reader_state
-                                                    let segment_mut = &mut self.reader_state.segments[idx];
-                                                    segment_mut.status = SegmentStatus::Loading;
-                                                    self.active_analysis = Some("Đang tải dữ liệu...".to_string());
-                                                    
-                                                    let _ = self.tx.blocking_send(WorkerMessage::AnalyzeSegment {
-                                                        config: self.config.clone(),
-                                                        context,
-                                                        target_text,
-                                                        segment_id,
+                                            // Styling colors based on interaction state
+                                            let fill = if is_selected {
+                                                egui::Color32::from_rgb(254, 240, 138) // Tailwind yellow-300 (#fef08a)
+                                            } else if is_hovered {
+                                                egui::Color32::from_rgb(24, 24, 27) // Lighter dark for hovered
+                                            } else {
+                                                egui::Color32::from_rgb(16, 16, 18) // Base dark card color
+                                            };
+
+                                            let stroke = if is_selected {
+                                                egui::Stroke::new(1.8, egui::Color32::from_rgb(234, 179, 8)) // Accent yellow border
+                                            } else if is_hovered {
+                                                egui::Stroke::new(1.0, egui::Color32::from_rgb(63, 63, 70)) // Subtle border on hover
+                                            } else {
+                                                egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 39, 42)) // Standard dark border
+                                            };
+
+                                            let frame = egui::Frame::none()
+                                                .fill(fill)
+                                                .stroke(stroke)
+                                                .rounding(6.0)
+                                                .inner_margin(12.0)
+                                                .outer_margin(egui::Margin::symmetric(0.0, 4.0));
+
+                                            let response = frame.show(ui, |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        match &segment.status {
+                                                            SegmentStatus::Idle => {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("Đoạn #{}", segment.id + 1))
+                                                                        .size(11.0)
+                                                                        .strong()
+                                                                        .color(if is_selected {
+                                                                            egui::Color32::from_rgb(113, 63, 4) // Darker brown-yellow
+                                                                        } else {
+                                                                            egui::Color32::from_rgb(113, 113, 122)
+                                                                        }),
+                                                                );
+                                                            }
+                                                            SegmentStatus::Loading => {
+                                                                ui.spinner();
+                                                                ui.colored_label(
+                                                                    if is_selected {
+                                                                        egui::Color32::from_rgb(180, 83, 9)
+                                                                    } else {
+                                                                        egui::Color32::from_rgb(245, 158, 11)
+                                                                    },
+                                                                    "Đang phân tích..."
+                                                                );
+                                                            }
+                                                            SegmentStatus::Analyzed(_) => {
+                                                                ui.colored_label(
+                                                                    if is_selected {
+                                                                        egui::Color32::from_rgb(21, 128, 61)
+                                                                    } else {
+                                                                        egui::Color32::from_rgb(16, 185, 129)
+                                                                    },
+                                                                    "✓ Đã phân tích"
+                                                                );
+                                                            }
+                                                            SegmentStatus::Error(_) => {
+                                                                ui.colored_label(
+                                                                    if is_selected {
+                                                                        egui::Color32::from_rgb(185, 28, 28)
+                                                                    } else {
+                                                                        egui::Color32::from_rgb(239, 68, 68)
+                                                                    },
+                                                                    "⚠ Gặp lỗi"
+                                                                );
+                                                            }
+                                                        }
                                                     });
+                                                    
+                                                    ui.add_space(6.0);
+                                                    
+                                                    // High contrast text inside yellow selection frame
+                                                    let text_color = if is_selected {
+                                                        egui::Color32::from_rgb(28, 25, 23) // Stone-900 (Dark)
+                                                    } else {
+                                                        egui::Color32::from_rgb(228, 228, 231) // Zinc-200 (Light)
+                                                    };
+
+                                                    ui.label(
+                                                        egui::RichText::new(&segment.text)
+                                                            .size(14.5)
+                                                            .line_height(Some(20.0))
+                                                            .color(text_color),
+                                                    );
+                                                });
+                                            }).response;
+
+                                            let click_response = ui.interact(response.rect, response.id, egui::Sense::click());
+                                            
+                                            // Update hover status for the next frame
+                                            if click_response.hovered() {
+                                                next_hovered_id = Some(segment.id);
+                                            }
+
+                                            if click_response.clicked() {
+                                                self.selected_segment_id = Some(segment.id);
+                                                
+                                                let status = segment.status.clone();
+                                                let segment_id = segment.id;
+                                                
+                                                match &status {
+                                                    SegmentStatus::Analyzed(analysis) => {
+                                                        self.active_analysis = Some(analysis.clone());
+                                                    }
+                                                    SegmentStatus::Error(e) => {
+                                                        self.active_analysis = Some(format!("Lỗi trước đó: {}", e));
+                                                    }
+                                                    SegmentStatus::Loading => {
+                                                        self.active_analysis = Some("Đang tải dữ liệu...".to_string());
+                                                    }
+                                                    SegmentStatus::Idle => {
+                                                        // 1. Get Context and Target Text *before* borrowing mutable reference to segment
+                                                        let context = self.reader_state.get_sliding_window_context();
+                                                        let target_text = self.reader_state.segments[idx].text.clone();
+                                                        
+                                                        // 2. Perform mutable borrows of the reader_state
+                                                        let segment_mut = &mut self.reader_state.segments[idx];
+                                                        segment_mut.status = SegmentStatus::Loading;
+                                                        self.active_analysis = Some("Đang tải dữ liệu...".to_string());
+                                                        
+                                                        let _ = self.tx.blocking_send(WorkerMessage::AnalyzeSegment {
+                                                            config: self.config.clone(),
+                                                            context,
+                                                            target_text,
+                                                            segment_id,
+                                                        });
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    ui.add_space(20.0);
-                                });
+                                        ui.add_space(20.0);
+                                    });
+                            }
                         }
                     });
                 }
@@ -1246,4 +1335,291 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(UiApp::new(cc))),
     )
+}
+
+impl UiApp {
+    fn render_visual_pdf_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let file_path = match &self.reader_state.file_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let current_page = self.reader_state.current_page;
+
+        // If not loaded and not loading, trigger load
+        if self.rendered_page_data.is_none()
+            && self.rendering_page_index.is_none()
+            && self.page_render_error.is_none()
+        {
+            self.rendering_page_index = Some(current_page);
+            let _ = self.tx.blocking_send(WorkerMessage::RenderPage {
+                file_path,
+                page_index: current_page,
+            });
+        }
+
+        let mut retry_rendering = false;
+        if let Some(err) = &self.page_render_error {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.colored_label(egui::Color32::from_rgb(239, 68, 68), format!("Lỗi hiển thị trang PDF: {}", err));
+                if ui.button("🔄 Thử lại").clicked() {
+                    retry_rendering = true;
+                }
+            });
+        }
+        if retry_rendering {
+            self.page_render_error = None;
+        } else if let Some(data) = &self.rendered_page_data {
+            if data.page_index == current_page {
+                egui::ScrollArea::both()
+                    .id_source("pdf_visual_scroll")
+                    .show(ui, |ui| {
+                        // Display the PDF page image
+                        let max_width = ui.available_width();
+                        let max_height = ui.available_height() - 10.0;
+                        
+                        let img_size = data.texture.size_vec2();
+                        let aspect_ratio = img_size.x / img_size.y;
+                        
+                        let display_width = max_width.min(max_height * aspect_ratio);
+                        let display_height = display_width / aspect_ratio;
+                        let display_size = egui::vec2(display_width, display_height);
+
+                        let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::click());
+
+                        // Draw the image
+                        let mut mesh = egui::Mesh::with_texture(data.texture.id());
+                        mesh.add_rect_with_uv(
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        ui.painter().add(egui::Shape::mesh(mesh));
+
+                        let page_width = data.layout.width;
+                        let page_height = data.layout.height;
+
+                        let mut hovered_segment_id = None;
+
+                        // Click handling on PDF image
+                        if response.clicked() {
+                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                // Map click to PDF coordinates
+                                let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
+                                let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
+
+                                // Find word under click
+                                if let Some(clicked_word_idx) = data.layout.words.iter().position(|w| {
+                                    pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
+                                }) {
+                                    // Search segments
+                                    for segment in &self.reader_state.segments {
+                                        let matched = crate::document::find_segment_words(&data.layout.words, &segment.text);
+                                        if matched.contains(&clicked_word_idx) {
+                                            self.selected_segment_id = Some(segment.id);
+                                            let status = segment.status.clone();
+                                            let segment_id = segment.id;
+                                            match &status {
+                                                SegmentStatus::Analyzed(analysis) => {
+                                                    self.active_analysis = Some(analysis.clone());
+                                                }
+                                                SegmentStatus::Idle => {
+                                                    let context = self.reader_state.get_sliding_window_context();
+                                                    let target_text = segment.text.clone();
+                                                    
+                                                    if let Some(s_mut) = self.reader_state.segments.iter_mut().find(|s| s.id == segment_id) {
+                                                        s_mut.status = SegmentStatus::Loading;
+                                                    }
+                                                    self.active_analysis = Some("Đang tải dữ liệu...".to_string());
+
+                                                    let _ = self.tx.blocking_send(WorkerMessage::AnalyzeSegment {
+                                                        config: self.config.clone(),
+                                                        context,
+                                                        target_text,
+                                                        segment_id,
+                                                    });
+                                                }
+                                                _ => {}
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check hovering on image to highlight segment cards
+                        if let Some(pointer_pos) = response.hover_pos() {
+                            let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
+                            let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
+
+                            if let Some(hovered_word_idx) = data.layout.words.iter().position(|w| {
+                                pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
+                            }) {
+                                for segment in &self.reader_state.segments {
+                                    let matched = crate::document::find_segment_words(&data.layout.words, &segment.text);
+                                    if matched.contains(&hovered_word_idx) {
+                                        hovered_segment_id = Some(segment.id);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if self.hovered_segment_id != hovered_segment_id {
+                            self.hovered_segment_id = hovered_segment_id;
+                            ctx.request_repaint();
+                        }
+
+                        // Draw highlights for each segment
+                        for segment in &self.reader_state.segments {
+                            let matched_word_indices = crate::document::find_segment_words(&data.layout.words, &segment.text);
+                            if matched_word_indices.is_empty() {
+                                continue;
+                            }
+
+                            let is_selected = self.selected_segment_id == Some(segment.id);
+                            let is_hovered = self.hovered_segment_id == Some(segment.id);
+
+                            let fill_color = if is_selected {
+                                egui::Color32::from_rgba_unmultiplied(234, 179, 8, 80) // 30% yellow
+                            } else if is_hovered {
+                                egui::Color32::from_rgba_unmultiplied(59, 130, 246, 50) // 20% blue
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(16, 185, 129, 25) // 10% green (segment indicator)
+                            };
+
+                            let stroke_color = if is_selected {
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(234, 179, 8))
+                            } else if is_hovered {
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246))
+                            } else {
+                                egui::Stroke::NONE
+                            };
+
+                            for idx in matched_word_indices {
+                                let w = &data.layout.words[idx];
+                                let screen_x_min = rect.min.x + (w.x_min / page_width) * rect.width();
+                                let screen_x_max = rect.min.x + (w.x_max / page_width) * rect.width();
+                                let screen_y_min = rect.min.y + (w.y_min / page_height) * rect.height();
+                                let screen_y_max = rect.min.y + (w.y_max / page_height) * rect.height();
+
+                                let word_rect = egui::Rect::from_min_max(
+                                    egui::pos2(screen_x_min, screen_y_min),
+                                    egui::pos2(screen_x_max, screen_y_max),
+                                );
+
+                                ui.painter().rect(word_rect, 2.0, fill_color, stroke_color);
+                            }
+                        }
+                    });
+            } else {
+                self.rendered_page_data = None;
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(10.0);
+                    ui.label("Đang dựng hình ảnh trang PDF...");
+                });
+            });
+        }
+    }
+}
+
+async fn render_pdf_page_task(
+    file_path: &std::path::Path,
+    page_index: usize,
+) -> Result<(egui::ColorImage, crate::document::PageLayout), String> {
+    // 1. Create temp directory
+    let temp_dir = std::env::temp_dir().join(format!(
+        "my_reader_render_{}_{}_{}",
+        std::process::id(),
+        page_index,
+        tokio::time::Instant::now().elapsed().as_micros()
+    ));
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("Không thể tạo thư mục tạm: {}", e))?;
+
+    // 2. Render PNG using pdftoppm
+    let page_num_str = (page_index + 1).to_string();
+    let ppm_status = tokio::process::Command::new("pdftoppm")
+        .arg("-png")
+        .arg("-r")
+        .arg("150")
+        .arg("-f")
+        .arg(&page_num_str)
+        .arg("-l")
+        .arg(&page_num_str)
+        .arg(file_path)
+        .arg(temp_dir.join("page"))
+        .status()
+        .await
+        .map_err(|e| format!("Không thể chạy pdftoppm: {}", e))?;
+
+    if !ppm_status.success() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err("pdftoppm chạy thất bại".to_string());
+    }
+
+    // 3. Find the rendered PNG file
+    let mut png_path = None;
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "png").unwrap_or(false) {
+                png_path = Some(path);
+                break;
+            }
+        }
+    }
+
+    let png_path = match png_path {
+        Some(p) => p,
+        None => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err("Không tìm thấy file ảnh được sinh ra bởi pdftoppm".to_string());
+        }
+    };
+
+    // 4. Load and decode image
+    let img_bytes = std::fs::read(&png_path)
+        .map_err(|e| format!("Không thể đọc file ảnh: {}", e))?;
+    
+    let image = image::load_from_memory_with_format(&img_bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("Không thể decode file ảnh: {}", e))?;
+    
+    let size = [image.width() as usize, image.height() as usize];
+    let image_buffer = image.to_rgba8();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        image_buffer.as_flat_samples().as_slice(),
+    );
+
+    // Clean up temp directory
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // 5. Extract layout (bbox) using pdftotext
+    let text_output = tokio::process::Command::new("pdftotext")
+        .arg("-f")
+        .arg(&page_num_str)
+        .arg("-l")
+        .arg(&page_num_str)
+        .arg("-bbox")
+        .arg(file_path)
+        .arg("-")
+        .output()
+        .await
+        .map_err(|e| format!("Không thể chạy pdftotext: {}", e))?;
+
+    if !text_output.status.success() {
+        return Err("pdftotext chạy thất bại".to_string());
+    }
+
+    let html = String::from_utf8_lossy(&text_output.stdout);
+    let layout = crate::document::parse_bbox_html(&html)
+        .ok_or_else(|| "Không thể phân tích dữ liệu layout của trang".to_string())?;
+
+    Ok((color_image, layout))
 }

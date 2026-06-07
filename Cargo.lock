@@ -2404,7 +2404,9 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "image",
  "lopdf",
+ "regex",
  "reqwest",
  "rfd",
  "serde",
@@ -3940,6 +3942,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.4",
  "tokio-macros",
  "windows-sys 0.61.2",
