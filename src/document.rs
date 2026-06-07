@@ -34,6 +34,7 @@ pub struct DocumentSegment {
     pub start_offset: usize,
     pub end_offset: usize,
     pub status: SegmentStatus,
+    pub is_gap: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -203,6 +204,7 @@ impl ReaderState {
                 start_offset,
                 end_offset,
                 status: SegmentStatus::Idle,
+                is_gap: false,
             });
         }
         self.segments = segments;
@@ -252,6 +254,37 @@ impl ReaderState {
         }
         offsets
     }
+
+    /// Extract a range of text between two absolute offsets, safely respecting character boundaries
+    pub fn get_text_range(&self, start: usize, end: usize) -> String {
+        let mut result = String::new();
+        let page_offsets = self.get_page_absolute_offsets();
+        for (i, page) in self.pages.iter().enumerate() {
+            let (p_start, p_end) = page_offsets[i];
+            if p_start < end && p_end > start {
+                let overlap_start = start.max(p_start);
+                let overlap_end = end.min(p_end);
+                if overlap_start < overlap_end {
+                    let mut rel_start = overlap_start - p_start;
+                    let mut rel_end = overlap_end - p_start;
+                    while rel_start < page.len() && !page.is_char_boundary(rel_start) {
+                        rel_start += 1;
+                    }
+                    while rel_end > 0 && !page.is_char_boundary(rel_end) {
+                        rel_end -= 1;
+                    }
+                    if rel_start < rel_end {
+                        let page_slice = &page[rel_start..rel_end];
+                        if !result.is_empty() && rel_start == 0 {
+                            result.push('\n');
+                        }
+                        result.push_str(page_slice);
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +311,28 @@ mod tests {
         assert!(context.contains("Paragraph 1 line 1"));
         
         let _ = std::fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn test_get_text_range() {
+        let state = ReaderState {
+            pages: vec![
+                "Hello".to_string(),
+                "World".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(state.get_text_range(0, 3), "Hel");
+        assert_eq!(state.get_text_range(0, 8), "Hello\nWo");
+
+        let state_utf8 = ReaderState {
+            pages: vec![
+                "Xin–Chào".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state_utf8.get_text_range(0, 5), "Xin");
     }
 
     #[test]

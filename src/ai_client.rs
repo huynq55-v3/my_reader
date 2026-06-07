@@ -202,7 +202,7 @@ pub async fn analyze_segment(
 pub async fn segment_text(
     config: &AppConfig,
     combined_text: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<(String, usize, usize)>, String> {
     if config.api_key.trim().is_empty() {
         return Err("API Key trống. Vui lòng cấu hình API Key trong phần Cài đặt.".to_string());
     }
@@ -439,7 +439,7 @@ pub async fn segment_text(
         // Extract segment text
         let segment_text = combined_text[start_idx..end_idx].trim().to_string();
         if !segment_text.is_empty() {
-            reconstructed_chunks.push(segment_text);
+            reconstructed_chunks.push((segment_text, start_idx, end_idx));
         }
         
         current_pos = end_idx;

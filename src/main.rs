@@ -15,6 +15,7 @@ pub struct SegmentationSuccess {
     pub page_offsets: Vec<(usize, usize, usize)>,  // page, start, end in combined_text
     pub file_path: PathBuf,
     pub window_start_abs: usize,
+    pub window_end_abs: usize,
 }
 
 pub enum WorkerMessage {
@@ -26,6 +27,7 @@ pub enum WorkerMessage {
         current_page: usize,
         file_path: PathBuf,
         window_start_abs: usize,
+        window_end_abs: usize,
     },
     AnalyzeSegment {
         config: AppConfig,
@@ -76,6 +78,7 @@ pub struct UiApp {
     page_jump_text: String,
     hovered_segment_id: Option<usize>,
     is_segmented: bool,
+    is_fully_segmented: bool,
 
     // Visual PDF view state
     visual_view: bool,
@@ -133,35 +136,14 @@ impl UiApp {
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerMessage::SegmentText { config, combined_text, page_offsets, current_page, file_path, window_start_abs } => {
+                        WorkerMessage::SegmentText { config, combined_text, page_offsets, current_page: _, file_path, window_start_abs, window_end_abs } => {
                             tokio::spawn(async move {
                                 let res = crate::ai_client::segment_text(&config, &combined_text).await;
                                 
                                 let processed_res = match res {
                                     Ok(chunks) => {
-                                        // 1. Calculate offsets for all chunks in combined_text
-                                        let mut all_segments = Vec::new();
-                                        for chunk in &chunks {
-                                            if let Some((start_idx, end_idx)) = find_approximate_match(&combined_text, chunk) {
-                                                all_segments.push((chunk.clone(), start_idx, end_idx));
-                                            } else {
-                                                // Fallback if not found: map to start of combined_text
-                                                all_segments.push((chunk.clone(), 0, chunk.len()));
-                                            }
-                                        }
-
-                                        // 2. Filter chunks that overlap with current_page
-                                        let page_bound = page_offsets.iter().find(|(p, _, _)| *p == current_page);
-                                        let mut filtered_chunks = Vec::new();
-                                        if let Some((_, page_start, page_end)) = page_bound {
-                                            for (chunk, start_idx, end_idx) in &all_segments {
-                                                if *start_idx < *page_end && *end_idx > *page_start {
-                                                    filtered_chunks.push(chunk.clone());
-                                                }
-                                            }
-                                        } else {
-                                            filtered_chunks = chunks;
-                                        }
+                                        let all_segments = chunks.clone();
+                                        let filtered_chunks = chunks.into_iter().map(|(text, _, _)| text).collect();
 
                                         Ok(SegmentationSuccess {
                                             filtered_chunks,
@@ -169,6 +151,7 @@ impl UiApp {
                                             page_offsets,
                                             file_path,
                                             window_start_abs,
+                                            window_end_abs,
                                         })
                                     }
                                     Err(e) => Err(e),
@@ -234,6 +217,7 @@ impl UiApp {
             page_jump_text: String::new(),
             hovered_segment_id: None,
             is_segmented: false,
+            is_fully_segmented: false,
             visual_view: true,
             rendered_page_data: None,
             rendering_page_index: None,
@@ -264,39 +248,88 @@ impl UiApp {
             let (page_start, page_end) = page_offsets_all[current_page];
             let covered_until = self.cache.get_covered_until(&file_path_str, page_start, page_end);
 
-            if covered_until >= page_end {
-                // If not marked as segmented yet, mark it now
-                if !self.cache.is_page_segmented(&file_path_str, current_page) {
-                    self.cache.update_segments(&file_path_str, current_page, page_start, page_end, vec![]);
-                }
-                
-                if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
-                    if !cached_segs.is_empty() {
-                        self.reader_state.segments = cached_segs
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, seg)| DocumentSegment {
-                                id: idx,
-                                text: seg.text,
-                                start_offset: seg.start_offset,
-                                end_offset: seg.end_offset,
-                                status: match seg.analysis {
-                                    Some(ref analysis) => SegmentStatus::Analyzed(analysis.clone()),
-                                    None => SegmentStatus::Idle,
-                                },
-                            })
-                            .collect();
-                        self.reader_state.segmentation_loading = false;
-                        self.reader_state.segmentation_error = None;
-                        self.is_segmented = true;
-                        return; // Cached hit! Loaded successfully.
+            if covered_until >= page_end && !self.cache.is_page_segmented(&file_path_str, current_page) {
+                self.cache.update_segments(&file_path_str, current_page, page_start, page_end, vec![]);
+            }
+            
+            if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
+                if !cached_segs.is_empty() {
+                    let mut filled_segs = Vec::new();
+                    let mut current_offset = page_start;
+                    let mut idx_counter = 0;
+
+                    for seg in cached_segs {
+                        // 1. If there is a gap before this segment, create a dummy segment
+                        if seg.start_offset > current_offset {
+                            let gap_text = self.reader_state.get_text_range(current_offset, seg.start_offset);
+                            if !gap_text.trim().is_empty() {
+                                filled_segs.push(DocumentSegment {
+                                    id: idx_counter,
+                                    text: gap_text,
+                                    start_offset: current_offset,
+                                    end_offset: seg.start_offset,
+                                    status: SegmentStatus::Idle,
+                                    is_gap: true,
+                                });
+                                idx_counter += 1;
+                            }
+                        }
+
+                        // 2. Add the actual segment
+                        filled_segs.push(DocumentSegment {
+                            id: idx_counter,
+                            text: seg.text,
+                            start_offset: seg.start_offset,
+                            end_offset: seg.end_offset,
+                            status: match seg.analysis {
+                                Some(ref analysis) => SegmentStatus::Analyzed(analysis.clone()),
+                                None => SegmentStatus::Idle,
+                            },
+                            is_gap: false,
+                        });
+                        idx_counter += 1;
+
+                        current_offset = seg.end_offset;
                     }
+
+                    // 3. If there is a gap after the last segment, create a dummy segment
+                    if current_offset < page_end {
+                        let gap_text = self.reader_state.get_text_range(current_offset, page_end);
+                        if !gap_text.trim().is_empty() {
+                            filled_segs.push(DocumentSegment {
+                                id: idx_counter,
+                                text: gap_text,
+                                start_offset: current_offset,
+                                end_offset: page_end,
+                                status: SegmentStatus::Idle,
+                                is_gap: true,
+                            });
+                        }
+                    }
+
+                    self.reader_state.segments = filled_segs;
+                    self.reader_state.segmentation_loading = false;
+                    self.reader_state.segmentation_error = None;
+                    self.is_segmented = true;
+
+                    // Calculate if it is fully segmented (no unsegmented gaps left)
+                    let first_segmented_offset = self.cache.get_next_segment_start(&file_path_str, covered_until)
+                        .unwrap_or(page_offsets_all.last().unwrap().1);
+                    let total_pages = self.reader_state.pages.len();
+                    let window = self.config.context_window_size;
+                    let end_page = if current_page + window < total_pages { current_page + window } else { total_pages - 1 };
+                    let max_allowed_end = page_offsets_all[end_page].1;
+                    let window_end_abs = first_segmented_offset.min(max_allowed_end);
+
+                    self.is_fully_segmented = covered_until >= window_end_abs;
+                    return; // Cached hit! Loaded successfully.
                 }
             }
         }
 
         // If cache miss, reset view to normal unsegmented text
         self.is_segmented = false;
+        self.is_fully_segmented = false;
         self.reader_state.segments.clear();
         self.reader_state.segmentation_loading = false;
         self.reader_state.segmentation_error = None;
@@ -313,6 +346,8 @@ impl UiApp {
         // Check if API key is configured. If empty, fall back immediately to local segmentation
         if self.config.api_key.trim().is_empty() {
             self.reader_state.fallback_local_segmentation();
+            self.is_segmented = true;
+            self.is_fully_segmented = true;
             return;
         }
 
@@ -320,39 +355,49 @@ impl UiApp {
         self.reader_state.segmentation_error = None;
         self.reader_state.segments.clear();
 
-        // Calculate sliding window page indices dynamically (only looking forward for context)
         let current_page = self.reader_state.current_page;
         let file_path = self.reader_state.file_path.clone().unwrap_or_default();
         let file_path_str = file_path.to_string_lossy().to_string();
         let page_offsets_all = self.reader_state.get_page_absolute_offsets();
 
+        if current_page >= page_offsets_all.len() {
+            self.reader_state.segmentation_loading = false;
+            return;
+        }
+
+        let (page_start, page_end) = page_offsets_all[current_page];
+        let covered_start = self.cache.get_covered_until(&file_path_str, page_start, page_end);
+
+        // Find the start offset of the very next cached segment after covered_start to avoid overlap
+        let first_segmented_offset = self.cache.get_next_segment_start(&file_path_str, covered_start)
+            .unwrap_or(page_offsets_all.last().unwrap().1); // fallback to end of document
+
         let total_pages = self.reader_state.pages.len();
         let window = self.config.context_window_size;
         let end_page = if current_page + window < total_pages { current_page + window } else { total_pages - 1 };
+        let max_allowed_end = page_offsets_all[end_page].1;
 
-        let mut combined_text = String::new();
-        let mut page_offsets = Vec::new();
+        let window_end_abs = first_segmented_offset.min(max_allowed_end);
 
-        // 1. Unsegmented part of the target page
-        let (page_start, _page_end) = page_offsets_all[current_page];
-        let covered_until = self.cache.get_covered_until(&file_path_str, page_start, _page_end);
-        let page_text = &self.reader_state.pages[current_page];
-        let relative_offset = (covered_until - page_start).min(page_text.len());
-        let unsegmented_text = &page_text[relative_offset..];
-
-        let start_offset = 0;
-        combined_text.push_str(unsegmented_text);
-        let end_offset = combined_text.len();
-        page_offsets.push((current_page, start_offset, end_offset));
-
-        // 2. Succeeding pages for context
-        for p in (current_page + 1)..=end_page {
-            combined_text.push('\n');
-            let start_offset = combined_text.len();
-            combined_text.push_str(&self.reader_state.pages[p]);
-            let end_offset = combined_text.len();
-            page_offsets.push((p, start_offset, end_offset));
+        if covered_start >= window_end_abs {
+            // No unsegmented text left! Just load from cache.
+            self.reader_state.segmentation_loading = false;
+            self.check_cache_or_reset();
+            return;
         }
+
+        // We want to send context pages before current_page as well, up to `window` pages.
+        let start_page = if current_page >= window { current_page - window } else { 0 };
+        let context_start_abs = page_offsets_all[start_page].0;
+
+        let combined_text = self.reader_state.get_text_range(context_start_abs, window_end_abs);
+        if combined_text.trim().is_empty() {
+            self.reader_state.segmentation_loading = false;
+            self.check_cache_or_reset();
+            return;
+        }
+
+        let page_offsets = vec![(current_page, 0, combined_text.len())];
 
         let _ = self.tx.blocking_send(WorkerMessage::SegmentText {
             config: self.config.clone(),
@@ -360,7 +405,8 @@ impl UiApp {
             page_offsets,
             current_page,
             file_path,
-            window_start_abs: covered_until,
+            window_start_abs: context_start_abs,
+            window_end_abs,
         });
     }
 
@@ -384,7 +430,7 @@ impl UiApp {
                 UiMessage::SegmentationResult(res) => {
                     self.reader_state.segmentation_loading = false;
                     match res {
-                Ok(success) => {
+                        Ok(success) => {
                             self.selected_segment_id = None;
                             self.active_analysis = None;
                             self.reader_state.segmentation_error = None;
@@ -392,63 +438,55 @@ impl UiApp {
                             // 1. Cache the result persistently first
                             let file_path_str = success.file_path.to_string_lossy().to_string();
                             if !file_path_str.is_empty() {
-                                let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
-                                let window_pages: Vec<usize> = success.page_offsets.iter().map(|(p, _, _)| *p).collect();
-                                if !window_pages.is_empty() {
-                                    let start_page = window_pages[0];
-                                    let end_page = window_pages[window_pages.len() - 1];
+                                let current_page = self.reader_state.current_page;
+                                let page_offsets_all = self.reader_state.get_page_absolute_offsets();
 
-                                    if start_page < page_absolute_offsets.len() && end_page < page_absolute_offsets.len() {
-                                        let window_start_char = success.window_start_abs;
-                                        let window_end_char = page_absolute_offsets[end_page].1;
-                                        let abs_start_offset = success.window_start_abs;
+                                if current_page < page_offsets_all.len() {
+                                    let (page_start, page_end) = page_offsets_all[current_page];
+                                    let covered_start = self.cache.get_covered_until(&file_path_str, page_start, page_end);
 
-                                        let cached_segs: Vec<crate::cache::CachedSegment> = success.all_segments
-                                            .into_iter()
-                                            .map(|(text, start, end)| crate::cache::CachedSegment {
-                                                text,
-                                                start_offset: abs_start_offset + start,
-                                                end_offset: abs_start_offset + end,
-                                                analysis: None,
-                                            })
-                                            .collect();
+                                    let target_start = covered_start;
+                                    let target_end = page_end;
 
-                                        self.cache.update_segments(
-                                            &file_path_str,
-                                            self.reader_state.current_page,
-                                            window_start_char,
-                                            window_end_char,
-                                            cached_segs,
-                                        );
+                                    let abs_start_offset = success.window_start_abs;
+
+                                    let mut cached_segs: Vec<crate::cache::CachedSegment> = success.all_segments
+                                        .into_iter()
+                                        .map(|(text, start, end)| crate::cache::CachedSegment {
+                                            text,
+                                            start_offset: abs_start_offset + start,
+                                            end_offset: abs_start_offset + end,
+                                            analysis: None,
+                                        })
+                                        .filter(|seg| {
+                                            // Keep only segments that overlap with target page N's unsegmented range
+                                            seg.start_offset < target_end && seg.end_offset > target_start
+                                        })
+                                        .collect();
+
+                                    // Copy analysis from old overlapping segments if they have the exact same offsets
+                                    if let Some(doc) = self.cache.documents.get(&file_path_str) {
+                                        for new_seg in &mut cached_segs {
+                                            if let Some(old_seg) = doc.segments.iter().find(|s| {
+                                                s.start_offset == new_seg.start_offset && s.end_offset == new_seg.end_offset
+                                            }) {
+                                                new_seg.analysis = old_seg.analysis.clone();
+                                            }
+                                        }
                                     }
+
+                                    self.cache.update_segments(
+                                        &file_path_str,
+                                        current_page,
+                                        target_start,
+                                        target_end,
+                                        cached_segs,
+                                    );
                                 }
                             }
 
                             // 2. Query the cache and load the segments for the current page
-                            if !file_path_str.is_empty() {
-                                let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
-                                let current_page = self.reader_state.current_page;
-                                if current_page < page_absolute_offsets.len() {
-                                    let (page_start, page_end) = page_absolute_offsets[current_page];
-                                    if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
-                                        self.reader_state.segments = cached_segs
-                                            .into_iter()
-                                            .enumerate()
-                                            .map(|(idx, seg)| DocumentSegment {
-                                                id: idx,
-                                                text: seg.text,
-                                                start_offset: seg.start_offset,
-                                                end_offset: seg.end_offset,
-                                                status: match seg.analysis {
-                                                    Some(ref analysis) => SegmentStatus::Analyzed(analysis.clone()),
-                                                    None => SegmentStatus::Idle,
-                                                },
-                                            })
-                                            .collect();
-                                        self.is_segmented = true;
-                                    }
-                                }
-                            }
+                            self.check_cache_or_reset();
                         }
                         Err(e) => {
                             self.reader_state.segmentation_error = Some(e);
@@ -853,14 +891,24 @@ impl eframe::App for UiApp {
 
                             ui.separator();
 
-                            if !self.is_segmented {
+                            if !self.is_segmented || !self.is_fully_segmented {
                                 // Primary button to trigger AI segmentation on demand
-                                if ui.add(egui::Button::new("⚡ Phân đoạn AI (Segment)").min_size(egui::vec2(130.0, 26.0)))
-                                    .on_hover_text("Sử dụng AI để chia trang này thành các phân đoạn thông tin nhỏ")
-                                    .clicked()
-                                {
-                                    retry_segmentation_trigger = true;
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui.add(egui::Button::new("⚡ Phân đoạn AI (Segment)").min_size(egui::vec2(130.0, 26.0)))
+                                        .on_hover_text("Sử dụng AI để chia trang này thành các phân đoạn thông tin nhỏ")
+                                        .clicked()
+                                    {
+                                        retry_segmentation_trigger = true;
+                                    }
+                                    
+                                    if self.is_segmented {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button("📄 Văn bản thường (Plain Text)").on_hover_text("Quay lại chế độ xem văn bản gốc chưa phân đoạn").clicked() {
+                                                show_original_trigger = true;
+                                            }
+                                        });
+                                    }
+                                });
                             } else {
                                 if !is_pdf || !self.visual_view {
                                     ui.label(egui::RichText::new("Nhấp vào bất kỳ đoạn văn nào bên dưới để AI phân tích ngữ cảnh.").weak());
@@ -962,6 +1010,18 @@ impl eframe::App for UiApp {
                                         // Draw segments of the current page
                                         for idx in 0..self.reader_state.segments.len() {
                                             let segment = &self.reader_state.segments[idx];
+                                            if segment.is_gap {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    egui::RichText::new(&segment.text)
+                                                        .size(14.5)
+                                                        .line_height(Some(20.0))
+                                                        .color(egui::Color32::from_rgb(180, 180, 180)),
+                                                );
+                                                ui.add_space(4.0);
+                                                continue;
+                                            }
+
                                             let is_selected = self.selected_segment_id == Some(segment.id);
                                             let is_hovered = self.hovered_segment_id == Some(segment.id);
 
@@ -1111,6 +1171,8 @@ impl eframe::App for UiApp {
         // Trigger local fallback outside central panel
         if fallback_local_trigger {
             self.reader_state.fallback_local_segmentation();
+            self.is_segmented = true;
+            self.is_fully_segmented = true;
         }
 
         // Trigger retry AI segmentation outside central panel
@@ -1301,10 +1363,6 @@ fn configure_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn find_approximate_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-    crate::ai_client::find_normalized(haystack, needle)
-}
-
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1407,6 +1465,9 @@ impl UiApp {
                                 }) {
                                     // Search segments
                                     for segment in &self.reader_state.segments {
+                                        if segment.is_gap {
+                                            continue;
+                                        }
                                         let seg_start_rel = segment.start_offset.saturating_sub(page_start);
                                         let seg_end_rel = segment.end_offset.saturating_sub(page_start);
                                         if clicked_word.start_offset < seg_end_rel && clicked_word.end_offset > seg_start_rel {
@@ -1452,6 +1513,9 @@ impl UiApp {
                                     pdf_x >= w.x_min && pdf_x <= w.x_max && pdf_y >= w.y_min && pdf_y <= w.y_max
                                 }) {
                                     for segment in &self.reader_state.segments {
+                                        if segment.is_gap {
+                                            continue;
+                                        }
                                         let seg_start_rel = segment.start_offset.saturating_sub(page_start);
                                         let seg_end_rel = segment.end_offset.saturating_sub(page_start);
                                         if hovered_word.start_offset < seg_end_rel && hovered_word.end_offset > seg_start_rel {
@@ -1471,6 +1535,9 @@ impl UiApp {
                         // Draw highlights for each segment
                         if self.is_segmented {
                             for segment in &self.reader_state.segments {
+                                if segment.is_gap {
+                                    continue;
+                                }
                                 let seg_start_rel = segment.start_offset.saturating_sub(page_start);
                                 let seg_end_rel = segment.end_offset.saturating_sub(page_start);
 

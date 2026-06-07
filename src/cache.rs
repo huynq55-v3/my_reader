@@ -169,6 +169,18 @@ impl AppCache {
         Some(page_segs)
     }
 
+    /// Find the start offset of the first cached segment that starts at or after `from_offset`.
+    /// If none exists, returns `None`.
+    pub fn get_next_segment_start(&self, file_path: &str, from_offset: usize) -> Option<usize> {
+        let doc = self.documents.get(file_path)?;
+        for seg in &doc.segments {
+            if seg.start_offset >= from_offset {
+                return Some(seg.start_offset);
+            }
+        }
+        None
+    }
+
     /// Check if a page is already marked as segmented
     pub fn is_page_segmented(&self, file_path: &str, page: usize) -> bool {
         if let Some(doc) = self.documents.get(file_path) {
