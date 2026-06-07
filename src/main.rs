@@ -18,6 +18,14 @@ pub struct SegmentationSuccess {
     pub window_end_abs: usize,
 }
 
+pub struct SegmentationBatchSuccess {
+    pub all_segments: Vec<(String, usize, usize)>, // (text, start, end in combined_text)
+    pub target_pages: Vec<usize>,
+    pub file_path: PathBuf,
+    pub window_start_abs: usize,
+    pub window_end_abs: usize,
+}
+
 pub enum WorkerMessage {
     LoadFile(PathBuf),
     SegmentText {
@@ -25,6 +33,14 @@ pub enum WorkerMessage {
         combined_text: String,
         page_offsets: Vec<(usize, usize, usize)>,
         current_page: usize,
+        file_path: PathBuf,
+        window_start_abs: usize,
+        window_end_abs: usize,
+    },
+    SegmentTextBatch {
+        config: AppConfig,
+        combined_text: String,
+        target_pages: Vec<usize>,
         file_path: PathBuf,
         window_start_abs: usize,
         window_end_abs: usize,
@@ -44,6 +60,7 @@ pub enum WorkerMessage {
 pub enum UiMessage {
     FileLoaded(Result<ReaderState, String>),
     SegmentationResult(Result<SegmentationSuccess, String>),
+    SegmentationBatchResult(Result<SegmentationBatchSuccess, String>),
     AnalysisResult(usize, Result<String, String>),
     PageRendered {
         page_index: usize,
@@ -85,6 +102,20 @@ pub struct UiApp {
     rendered_page_data: Option<RenderedPageData>,
     rendering_page_index: Option<usize>,
     page_render_error: Option<String>,
+
+    // Batch Segmentation state
+    is_batch_open: bool,
+    batch_start_page: String,
+    batch_end_page: String,
+    batch_loading: bool,
+
+    // Manual Segmentation state
+    manual_start_offset: Option<usize>,
+    manual_end_offset: Option<usize>,
+    manual_fixed_start: Option<usize>,
+    manual_fixed_end: Option<usize>,
+    manual_dragging: bool,
+    manual_drag_start_word_idx: Option<usize>,
 }
 
 impl UiApp {
@@ -161,6 +192,27 @@ impl UiApp {
                                 ctx.request_repaint();
                             });
                         }
+                        WorkerMessage::SegmentTextBatch { config, combined_text, target_pages, file_path, window_start_abs, window_end_abs } => {
+                            tokio::spawn(async move {
+                                let res = crate::ai_client::segment_text(&config, &combined_text).await;
+                                
+                                let processed_res = match res {
+                                    Ok(chunks) => {
+                                        Ok(SegmentationBatchSuccess {
+                                            all_segments: chunks,
+                                            target_pages,
+                                            file_path,
+                                            window_start_abs,
+                                            window_end_abs,
+                                        })
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                
+                                let _ = ui_tx.send(UiMessage::SegmentationBatchResult(processed_res));
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerMessage::AnalyzeSegment {
                             config,
                             context,
@@ -222,6 +274,16 @@ impl UiApp {
             rendered_page_data: None,
             rendering_page_index: None,
             page_render_error: None,
+            is_batch_open: false,
+            batch_start_page: String::new(),
+            batch_end_page: String::new(),
+            batch_loading: false,
+            manual_start_offset: None,
+            manual_end_offset: None,
+            manual_fixed_start: None,
+            manual_fixed_end: None,
+            manual_dragging: false,
+            manual_drag_start_word_idx: None,
         }
     }
 
@@ -411,6 +473,51 @@ impl UiApp {
         });
     }
 
+    /// Trigger asynchronous batch segmentation for pages from start_page to end_page (0-indexed)
+    fn trigger_batch_segmentation(&mut self, start_page: usize, end_page: usize) {
+        if self.reader_state.pages.is_empty() {
+            return;
+        }
+        
+        let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+        let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+
+        if start_page >= page_offsets_all.len() || end_page >= page_offsets_all.len() || start_page > end_page {
+            self.error_message = Some("Phạm vi trang không hợp lệ.".to_string());
+            return;
+        }
+
+        self.batch_loading = true;
+
+        // Collect list of target pages in this batch
+        let target_pages: Vec<usize> = (start_page..=end_page).collect();
+
+        // Context pages before start_page (up to window size)
+        let window = self.config.context_window_size;
+        let context_start_page = if start_page >= window { start_page - window } else { 0 };
+        let window_start_abs = page_offsets_all[context_start_page].0;
+
+        // Context pages after end_page (up to window size)
+        let total_pages = self.reader_state.pages.len();
+        let context_end_page = if end_page + window < total_pages { end_page + window } else { total_pages - 1 };
+        let window_end_abs = page_offsets_all[context_end_page].1;
+
+        let combined_text = self.reader_state.get_text_range(window_start_abs, window_end_abs);
+        if combined_text.trim().is_empty() {
+            self.batch_loading = false;
+            return;
+        }
+
+        let _ = self.tx.blocking_send(WorkerMessage::SegmentTextBatch {
+            config: self.config.clone(),
+            combined_text,
+            target_pages,
+            file_path,
+            window_start_abs,
+            window_end_abs,
+        });
+    }
+
     /// Process messages from the background worker
     fn poll_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
@@ -491,6 +598,74 @@ impl UiApp {
                         }
                         Err(e) => {
                             self.reader_state.segmentation_error = Some(e);
+                        }
+                    }
+                }
+                UiMessage::SegmentationBatchResult(res) => {
+                    self.batch_loading = false;
+                    match res {
+                        Ok(success) => {
+                            self.is_batch_open = false;
+                            self.selected_segment_id = None;
+                            self.active_analysis = None;
+
+                            let file_path_str = success.file_path.to_string_lossy().to_string();
+                            if !file_path_str.is_empty() {
+                                let target_pages = success.target_pages;
+                                if !target_pages.is_empty() {
+                                    let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+                                    
+                                    // Range to segment is from the start of first target page to end of last target page
+                                    let first_page = target_pages[0];
+                                    let last_page = target_pages[target_pages.len() - 1];
+                                    
+                                    if first_page < page_offsets_all.len() && last_page < page_offsets_all.len() {
+                                        let page_start = page_offsets_all[first_page].0;
+                                        let page_end = page_offsets_all[last_page].1;
+
+                                        let abs_start_offset = success.window_start_abs;
+
+                                        let mut cached_segs: Vec<crate::cache::CachedSegment> = success.all_segments
+                                            .into_iter()
+                                            .map(|(text, start, end)| crate::cache::CachedSegment {
+                                                text,
+                                                start_offset: abs_start_offset + start,
+                                                end_offset: abs_start_offset + end,
+                                                analysis: None,
+                                            })
+                                            .filter(|seg| {
+                                                // Keep only segments that overlap with the target batch range
+                                                seg.start_offset < page_end && seg.end_offset > page_start
+                                            })
+                                            .collect();
+
+                                        // Copy analysis explanations from old overlapping segments if matching offsets
+                                        if let Some(doc) = self.cache.documents.get(&file_path_str) {
+                                            for new_seg in &mut cached_segs {
+                                                if let Some(old_seg) = doc.segments.iter().find(|s| {
+                                                    s.start_offset == new_seg.start_offset && s.end_offset == new_seg.end_offset
+                                                }) {
+                                                    new_seg.analysis = old_seg.analysis.clone();
+                                                }
+                                            }
+                                        }
+
+                                        self.cache.update_segments_batch(
+                                            &file_path_str,
+                                            target_pages,
+                                            page_start,
+                                            page_end,
+                                            cached_segs,
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Reload segments from cache
+                            self.check_cache_or_reset();
+                        }
+                        Err(e) => {
+                            self.error_message = Some(format!("Lỗi phân đoạn hàng loạt: {}", e));
                         }
                     }
                 }
@@ -579,6 +754,14 @@ impl eframe::App for UiApp {
 
                     if ui.button("⚙ Cấu hình API").on_hover_text("Thay đổi API Key, Endpoint, và Ngôn ngữ").clicked() {
                         self.is_config_open = true;
+                    }
+
+                    if !self.reader_state.pages.is_empty() {
+                        if ui.button("⚡ Phân đoạn hàng loạt").on_hover_text("Phân đoạn hàng loạt cho dải trang trong tài liệu").clicked() {
+                            self.batch_start_page = (self.reader_state.current_page + 1).to_string();
+                            self.batch_end_page = self.reader_state.pages.len().to_string();
+                            self.is_batch_open = true;
+                        }
                     }
 
                     ui.separator();
@@ -744,6 +927,72 @@ impl eframe::App for UiApp {
             }
         }
 
+        // 3.5 BATCH SEGMENTATION WINDOW
+        let mut is_batch_open = self.is_batch_open;
+        let mut close_batch = false;
+        if is_batch_open {
+            egui::Window::new("⚡ Phân đoạn hàng loạt (Batch)")
+                .open(&mut is_batch_open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("PHÂN ĐOẠN AI CHO DẢI TRANG").strong().color(egui::Color32::from_rgb(147, 197, 253)));
+                        ui.add_space(4.0);
+
+                        let total_pages = self.reader_state.pages.len();
+
+                        if self.batch_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Đang gọi API phân đoạn hàng loạt... Vui lòng chờ.");
+                            });
+                        } else {
+                            egui::Grid::new("batch_grid")
+                                .num_columns(2)
+                                .spacing([12.0, 10.0])
+                                .show(ui, |ui| {
+                                    ui.label("Trang bắt đầu (1-indexed):");
+                                    ui.text_edit_singleline(&mut self.batch_start_page);
+                                    ui.end_row();
+
+                                    ui.label("Trang kết thúc (1-indexed):");
+                                    ui.text_edit_singleline(&mut self.batch_end_page);
+                                    ui.end_row();
+                                });
+
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(format!(
+                                "Lưu ý: Ngữ cảnh sẽ lấy thêm ± {} trang ở đầu và cuối.",
+                                self.config.context_window_size
+                            )).weak().size(12.0));
+
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Bắt đầu phân đoạn").clicked() {
+                                    let start = self.batch_start_page.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
+                                    let end = self.batch_end_page.trim().parse::<usize>().unwrap_or(total_pages).saturating_sub(1);
+                                    
+                                    self.trigger_batch_segmentation(start, end);
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Đóng").clicked() {
+                                        close_batch = true;
+                                    }
+                                });
+                            });
+                        }
+                    });
+                });
+            self.is_batch_open = is_batch_open && !close_batch;
+        }
+
         // 4. RIGHT SIDE PANEL: AI ANALYSIS SIDEBAR
         let mut should_retry = false;
 
@@ -761,6 +1010,132 @@ impl eframe::App for UiApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
+
+                // --- MANUAL SEGMENTATION PANEL ---
+                let manual_active = self.manual_start_offset.is_some() && self.manual_end_offset.is_some();
+                let fixed_active = self.manual_fixed_start.is_some() || self.manual_fixed_end.is_some();
+
+                if manual_active || fixed_active {
+                    ui.group(|ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("✍ Phân đoạn thủ công").strong().color(egui::Color32::from_rgb(59, 130, 246)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("❌ Hủy chọn").clicked() {
+                                        self.manual_start_offset = None;
+                                        self.manual_end_offset = None;
+                                        self.manual_fixed_start = None;
+                                        self.manual_fixed_end = None;
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
+
+                            // Display current dragged/highlighted selection text if active
+                            if manual_active {
+                                let start = self.manual_start_offset.unwrap();
+                                let end = self.manual_end_offset.unwrap();
+                                let selected_text = self.reader_state.get_text_range(start, end);
+                                ui.label(egui::RichText::new("Văn bản bôi đen:").weak().size(12.0));
+                                ui.label(egui::RichText::new(format!("\"{}\"", truncate_string(&selected_text, 120))).italics().size(13.0));
+                                ui.add_space(6.0);
+
+                                ui.horizontal(|ui| {
+                                    if ui.button("➕ Tạo Phân Đoạn").on_hover_text("Tạo phân đoạn từ văn bản bôi đen trên").clicked() {
+                                        let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+                                        let file_path_str = file_path.to_string_lossy().to_string();
+                                        if !file_path_str.is_empty() {
+                                            let new_seg = crate::cache::CachedSegment {
+                                                text: selected_text.clone(),
+                                                start_offset: start,
+                                                end_offset: end,
+                                                analysis: None,
+                                            };
+                                            self.cache.insert_manual_segment(&file_path_str, new_seg);
+                                            self.manual_start_offset = None;
+                                            self.manual_end_offset = None;
+                                            self.check_cache_or_reset();
+                                        }
+                                    }
+                                    
+                                    if ui.button("📌 Đặt làm Điểm Đầu").on_hover_text("Chốt điểm bắt đầu của vùng chọn này làm Điểm Đầu của phân đoạn liên trang").clicked() {
+                                        self.manual_fixed_start = Some(start);
+                                        self.manual_fixed_end = None; // Reset end to pick a new one
+                                        self.manual_start_offset = None;
+                                        self.manual_end_offset = None;
+                                    }
+                                    
+                                    if self.manual_fixed_start.is_some() {
+                                        if ui.button("📌 Đặt làm Điểm Cuối").on_hover_text("Chốt điểm kết thúc của vùng chọn này làm Điểm Cuối của phân đoạn liên trang").clicked() {
+                                            self.manual_fixed_end = Some(end);
+                                            self.manual_start_offset = None;
+                                            self.manual_end_offset = None;
+                                        }
+                                    }
+                                });
+                            }
+
+                            // Display fixed anchors for multi-page selections
+                            if fixed_active {
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Liên kết phân đoạn liên trang:").strong().size(12.0).color(egui::Color32::from_rgb(239, 68, 68)));
+                                
+                                if let Some(fs) = self.manual_fixed_start {
+                                    ui.label(format!("• Điểm Đầu (Start): Offset {}", fs));
+                                } else {
+                                    ui.label("• Điểm Đầu (Start): (Chưa chọn)");
+                                }
+
+                                if let Some(fe) = self.manual_fixed_end {
+                                    ui.label(format!("• Điểm Cuối (End): Offset {}", fe));
+                                } else {
+                                    ui.label("• Điểm Cuối (End): (Chưa chọn)");
+                                }
+
+                                if self.manual_fixed_start.is_some() && self.manual_fixed_end.is_some() {
+                                    ui.add_space(6.0);
+                                    let start = self.manual_fixed_start.unwrap();
+                                    let end = self.manual_fixed_end.unwrap();
+                                    
+                                    if start < end {
+                                        let spanning_text = self.reader_state.get_text_range(start, end);
+                                        ui.label(egui::RichText::new("Nội dung liên trang:").weak().size(12.0));
+                                        ui.label(egui::RichText::new(format!("\"{}\"", truncate_string(&spanning_text, 120))).italics().size(13.0));
+                                        ui.add_space(6.0);
+
+                                        if ui.button("➕ Tạo Phân Đoạn Liên Trang").clicked() {
+                                            let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+                                            let file_path_str = file_path.to_string_lossy().to_string();
+                                            if !file_path_str.is_empty() {
+                                                let new_seg = crate::cache::CachedSegment {
+                                                    text: spanning_text,
+                                                    start_offset: start,
+                                                    end_offset: end,
+                                                    analysis: None,
+                                                };
+                                                self.cache.insert_manual_segment(&file_path_str, new_seg);
+                                                
+                                                self.manual_fixed_start = None;
+                                                self.manual_fixed_end = None;
+                                                self.manual_start_offset = None;
+                                                self.manual_end_offset = None;
+                                                
+                                                self.check_cache_or_reset();
+                                            }
+                                        }
+                                    } else {
+                                        ui.colored_label(egui::Color32::from_rgb(239, 68, 68), "⚠ Lỗi: Điểm Cuối phải nằm sau Điểm Đầu!");
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                }
 
                 if let Some(seg_id) = self.selected_segment_id {
                     // Find the segment text
@@ -1434,7 +1809,7 @@ impl UiApp {
                                 ui.add_space(x_offset);
                             }
 
-                            let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::click());
+                            let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::click_and_drag());
 
                             // Draw the image
                             let mut mesh = egui::Mesh::with_texture(data.texture.id());
@@ -1452,6 +1827,46 @@ impl UiApp {
 
                         let page_offsets_all = self.reader_state.get_page_absolute_offsets();
                         let page_start = page_offsets_all.get(current_page).map(|&(s, _)| s).unwrap_or(0);
+
+                        // Drag selection handling
+                        if response.drag_started() {
+                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
+                                let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
+                                
+                                if let Some(idx) = find_closest_word_index(&data.layout.words, pdf_x, pdf_y) {
+                                    self.manual_drag_start_word_idx = Some(idx);
+                                    self.manual_dragging = true;
+                                    self.manual_start_offset = None;
+                                    self.manual_end_offset = None;
+                                }
+                            }
+                        }
+
+                        if self.manual_dragging && response.dragged() {
+                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                let pdf_x = ((pointer_pos.x - rect.min.x) / rect.width()) * page_width;
+                                let pdf_y = ((pointer_pos.y - rect.min.y) / rect.height()) * page_height;
+                                
+                                if let Some(start_idx) = self.manual_drag_start_word_idx {
+                                    if let Some(end_idx) = find_closest_word_index(&data.layout.words, pdf_x, pdf_y) {
+                                        let start_word = &data.layout.words[start_idx];
+                                        let end_word = &data.layout.words[end_idx];
+                                        
+                                        let abs_start = page_start + start_word.start_offset.min(end_word.start_offset);
+                                        let abs_end = page_start + start_word.end_offset.max(end_word.end_offset);
+                                        
+                                        self.manual_start_offset = Some(abs_start);
+                                        self.manual_end_offset = Some(abs_end);
+                                    }
+                                }
+                            }
+                        }
+
+                        if response.drag_stopped() {
+                            self.manual_dragging = false;
+                            self.manual_drag_start_word_idx = None;
+                        }
 
                         // Click handling on PDF image
                         if self.is_segmented && response.clicked() {
@@ -1578,6 +1993,55 @@ impl UiApp {
                                 }
                             }
                         }
+
+                        // Draw highlights for manual selection
+                        if let (Some(m_start), Some(m_end)) = (self.manual_start_offset, self.manual_end_offset) {
+                            let m_start_rel = m_start.saturating_sub(page_start);
+                            let m_end_rel = m_end.saturating_sub(page_start);
+
+                            let fill_color = egui::Color32::from_rgba_unmultiplied(59, 130, 246, 70); // 27% blue selection
+                            let stroke_color = egui::Stroke::new(1.0, egui::Color32::from_rgb(59, 130, 246));
+
+                            for w in &data.layout.words {
+                                if w.start_offset < m_end_rel && w.end_offset > m_start_rel {
+                                    let screen_x_min = rect.min.x + (w.x_min / page_width) * rect.width();
+                                    let screen_x_max = rect.min.x + (w.x_max / page_width) * rect.width();
+                                    let screen_y_min = rect.min.y + (w.y_min / page_height) * rect.height();
+                                    let screen_y_max = rect.min.y + (w.y_max / page_height) * rect.height();
+
+                                    let word_rect = egui::Rect::from_min_max(
+                                        egui::pos2(screen_x_min, screen_y_min),
+                                        egui::pos2(screen_x_max, screen_y_max),
+                                    );
+                                    ui.painter().rect(word_rect, 2.0, fill_color, stroke_color);
+                                }
+                            }
+                        }
+
+                        // Draw highlight for multi-page fixed selection start
+                        if let Some(fixed_start) = self.manual_fixed_start {
+                            let fs_rel = fixed_start.saturating_sub(page_start);
+                            // Draw a marker on the word where the fixed start was set on this page
+                            for w in &data.layout.words {
+                                if w.start_offset <= fs_rel && w.end_offset >= fs_rel {
+                                    let screen_x_min = rect.min.x + (w.x_min / page_width) * rect.width();
+                                    let screen_x_max = rect.min.x + (w.x_max / page_width) * rect.width();
+                                    let screen_y_min = rect.min.y + (w.y_min / page_height) * rect.height();
+                                    let screen_y_max = rect.min.y + (w.y_max / page_height) * rect.height();
+
+                                    let word_rect = egui::Rect::from_min_max(
+                                        egui::pos2(screen_x_min, screen_y_min),
+                                        egui::pos2(screen_x_max, screen_y_max),
+                                    );
+                                    ui.painter().rect(
+                                        word_rect,
+                                        2.0,
+                                        egui::Color32::from_rgba_unmultiplied(239, 68, 68, 70), // Red
+                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(239, 68, 68)),
+                                    );
+                                }
+                            }
+                        }
                     });
                 });
             } else {
@@ -1689,4 +2153,38 @@ async fn render_pdf_page_task(
         .ok_or_else(|| "Không thể phân tích dữ liệu layout của trang".to_string())?;
 
     Ok((color_image, layout))
+}
+
+fn find_closest_word_index(words: &[crate::document::WordBbox], x: f32, y: f32) -> Option<usize> {
+    if words.is_empty() {
+        return None;
+    }
+    let mut best_idx = 0;
+    let mut min_dist = f32::MAX;
+    
+    for (idx, w) in words.iter().enumerate() {
+        // Distance from point to word center
+        let cx = (w.x_min + w.x_max) / 2.0;
+        let cy = (w.y_min + w.y_max) / 2.0;
+        let dist = (cx - x).powi(2) + (cy - y).powi(2);
+        if dist < min_dist {
+            min_dist = dist;
+            best_idx = idx;
+        }
+    }
+    
+    // Ensure the click is reasonably close (e.g. within 150 pixels coordinate system)
+    if min_dist < 15000.0 {
+        Some(best_idx)
+    } else {
+        None
+    }
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.chars().count() > max_len {
+        s.chars().take(max_len).collect::<String>() + "..."
+    } else {
+        s.to_string()
+    }
 }

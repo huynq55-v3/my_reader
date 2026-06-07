@@ -106,6 +106,67 @@ impl AppCache {
         let _ = self.save();
     }
 
+    /// Update segments for a batch of pages.
+    /// Marks all target_pages as fully segmented.
+    /// Removes existing segments in [window_start, window_end] to prevent duplicate overlaps.
+    pub fn update_segments_batch(
+        &mut self,
+        file_path: &str,
+        target_pages: Vec<usize>,
+        window_start: usize,
+        window_end: usize,
+        new_segments: Vec<CachedSegment>,
+    ) {
+        let doc = self.documents.entry(file_path.to_string()).or_insert_with(|| DocumentCache {
+            file_path: file_path.to_string(),
+            segmented_pages: Vec::new(),
+            segments: Vec::new(),
+        });
+
+        // 1. Mark target pages as segmented
+        for page in target_pages {
+            if !doc.segmented_pages.contains(&page) {
+                doc.segmented_pages.push(page);
+            }
+        }
+        doc.segmented_pages.sort();
+
+        // 2. Remove segments that fall within the current window range
+        doc.segments.retain(|seg| {
+            seg.end_offset <= window_start || seg.start_offset >= window_end
+        });
+
+        // 3. Insert new segments and sort
+        doc.segments.extend(new_segments);
+        doc.segments.sort_by_key(|s| s.start_offset);
+
+        // Save immediately to disk
+        let _ = self.save();
+    }
+
+    /// Insert a manually created segment, resolving any overlaps by deleting overlapping cached segments
+    pub fn insert_manual_segment(&mut self, file_path: &str, new_segment: CachedSegment) {
+        let doc = self.documents.entry(file_path.to_string()).or_insert_with(|| DocumentCache {
+            file_path: file_path.to_string(),
+            segmented_pages: Vec::new(),
+            segments: Vec::new(),
+        });
+
+        let new_start = new_segment.start_offset;
+        let new_end = new_segment.end_offset;
+
+        // Remove any old segments that overlap with the new manual segment
+        doc.segments.retain(|seg| {
+            !(seg.start_offset < new_end && seg.end_offset > new_start)
+        });
+
+        // Add the new segment and sort
+        doc.segments.push(new_segment);
+        doc.segments.sort_by_key(|s| s.start_offset);
+
+        let _ = self.save();
+    }
+
     /// Update the cached analysis for a specific segment identified by its absolute offsets
     pub fn update_segment_analysis(
         &mut self,
@@ -278,6 +339,40 @@ mod tests {
         let updated_page_0_segs = cache.get_segments_for_page(file, 0, 20).unwrap();
         assert_eq!(updated_page_0_segs[0].analysis, Some("Analysis for page 0 segment".to_string()));
         assert_eq!(updated_page_0_segs[1].analysis, None);
+
+        // Test update_segments_batch
+        let batch_seg = CachedSegment {
+            text: "Hello batch segment".to_string(),
+            start_offset: 75,
+            end_offset: 95,
+            analysis: None,
+        };
+        cache.update_segments_batch(
+            file,
+            vec![2, 3],
+            70,
+            100,
+            vec![batch_seg],
+        );
+        assert!(cache.is_page_segmented(file, 2));
+        assert!(cache.is_page_segmented(file, 3));
+        let page_2_segs = cache.get_segments_for_page(file, 70, 100).unwrap();
+        assert_eq!(page_2_segs.len(), 1);
+        assert_eq!(page_2_segs[0].text, "Hello batch segment");
+
+        // Test insert_manual_segment (overlapping resolution)
+        let manual_seg = CachedSegment {
+            text: "Manual overlay".to_string(),
+            start_offset: 80,
+            end_offset: 90,
+            analysis: None,
+        };
+        cache.insert_manual_segment(file, manual_seg);
+        
+        let resolved_segs = cache.get_segments_for_page(file, 70, 100).unwrap();
+        // The batch segment [75, 95] should be removed because it overlaps with manual segment [80, 90]
+        assert_eq!(resolved_segs.len(), 1);
+        assert_eq!(resolved_segs[0].text, "Manual overlay");
     }
 }
 
