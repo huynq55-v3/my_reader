@@ -191,21 +191,16 @@ impl UiApp {
         }
     }
 
-    /// Request AI text segmentation for the current context window
-    fn trigger_segmentation(&mut self) {
+    /// Check if the current page has already been segmented and is fully cached.
+    /// If so, load the cached segments immediately and enter segmented view.
+    /// Otherwise, reset the page to the normal unsegmented text view.
+    fn check_cache_or_reset(&mut self) {
         if self.reader_state.pages.is_empty() {
             return;
         }
         self.selected_segment_id = None;
         self.active_analysis = None;
 
-        // Check if API key is configured. If empty, fall back immediately to local segmentation
-        if self.config.api_key.trim().is_empty() {
-            self.reader_state.fallback_local_segmentation();
-            return;
-        }
-
-        // Cache hit optimization: check if page is already fully covered by segments
         let current_page = self.reader_state.current_page;
         let file_path = self.reader_state.file_path.clone().unwrap_or_default();
         let file_path_str = file_path.to_string_lossy().to_string();
@@ -222,8 +217,30 @@ impl UiApp {
                 }
                 
                 if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
-                    if !cached_segs.is_empty() {
-                        self.reader_state.segments = cached_segs
+                    // Filter out segments that start on a previous page that is already segmented
+                    let mut filtered_segs = Vec::new();
+                    for seg in cached_segs {
+                        let page_idx_of_start = page_offsets_all.iter().position(|&(start, end)| {
+                            seg.start_offset >= start && seg.start_offset < end
+                        });
+                        
+                        let should_keep = if let Some(p_idx) = page_idx_of_start {
+                            if p_idx < current_page {
+                                !self.cache.is_page_segmented(&file_path_str, p_idx)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+                        
+                        if should_keep {
+                            filtered_segs.push(seg);
+                        }
+                    }
+
+                    if !filtered_segs.is_empty() {
+                        self.reader_state.segments = filtered_segs
                             .into_iter()
                             .enumerate()
                             .map(|(idx, seg)| DocumentSegment {
@@ -235,10 +252,31 @@ impl UiApp {
                         self.reader_state.segmentation_loading = false;
                         self.reader_state.segmentation_error = None;
                         self.is_segmented = true;
-                        return; // Cached hit! Bypasses network request entirely.
+                        return; // Cached hit! Loaded successfully.
                     }
                 }
             }
+        }
+
+        // If cache miss, reset view to normal unsegmented text
+        self.is_segmented = false;
+        self.reader_state.segments.clear();
+        self.reader_state.segmentation_loading = false;
+        self.reader_state.segmentation_error = None;
+    }
+
+    /// Request AI text segmentation for the current context window
+    fn trigger_segmentation(&mut self) {
+        if self.reader_state.pages.is_empty() {
+            return;
+        }
+        self.selected_segment_id = None;
+        self.active_analysis = None;
+
+        // Check if API key is configured. If empty, fall back immediately to local segmentation
+        if self.config.api_key.trim().is_empty() {
+            self.reader_state.fallback_local_segmentation();
+            return;
         }
 
         self.reader_state.segmentation_loading = true;
@@ -246,6 +284,11 @@ impl UiApp {
         self.reader_state.segments.clear();
 
         // Calculate sliding window page indices dynamically (only looking forward for context)
+        let current_page = self.reader_state.current_page;
+        let file_path = self.reader_state.file_path.clone().unwrap_or_default();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let page_offsets_all = self.reader_state.get_page_absolute_offsets();
+
         let total_pages = self.reader_state.pages.len();
         let window = self.config.context_window_size;
         let end_page = if current_page + window < total_pages { current_page + window } else { total_pages - 1 };
@@ -291,13 +334,8 @@ impl UiApp {
                     match res {
                         Ok(state) => {
                             self.reader_state = state;
-                            self.selected_segment_id = None;
-                            self.active_analysis = None;
-                            self.error_message = None;
                             self.page_jump_text = (self.reader_state.current_page + 1).to_string();
-                            
-                            // Load document normally without auto-segmenting
-                            self.is_segmented = false;
+                            self.check_cache_or_reset();
                         }
                         Err(e) => {
                             self.error_message = Some(e);
@@ -307,21 +345,12 @@ impl UiApp {
                 UiMessage::SegmentationResult(res) => {
                     self.reader_state.segmentation_loading = false;
                     match res {
-                        Ok(success) => {
-                            self.reader_state.segments = success.filtered_chunks
-                                .into_iter()
-                                .enumerate()
-                                .map(|(id, text)| DocumentSegment {
-                                    id,
-                                    text,
-                                    status: SegmentStatus::Idle,
-                                })
-                                .collect();
+                Ok(success) => {
                             self.selected_segment_id = None;
                             self.active_analysis = None;
                             self.reader_state.segmentation_error = None;
 
-                            // Cache the result persistently
+                            // 1. Cache the result persistently first
                             let file_path_str = success.file_path.to_string_lossy().to_string();
                             if !file_path_str.is_empty() {
                                 let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
@@ -351,6 +380,46 @@ impl UiApp {
                                             window_end_char,
                                             cached_segs,
                                         );
+                                    }
+                                }
+                            }
+
+                            // 2. Query the cache and apply our unified duplication-prevention filtering logic
+                            if !file_path_str.is_empty() {
+                                let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
+                                let current_page = self.reader_state.current_page;
+                                if current_page < page_absolute_offsets.len() {
+                                    let (page_start, page_end) = page_absolute_offsets[current_page];
+                                    if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
+                                        let mut filtered_segs = Vec::new();
+                                        for seg in cached_segs {
+                                            let page_idx_of_start = page_absolute_offsets.iter().position(|&(start, end)| {
+                                                seg.start_offset >= start && seg.start_offset < end
+                                            });
+                                            let should_keep = if let Some(p_idx) = page_idx_of_start {
+                                                if p_idx < current_page {
+                                                    !self.cache.is_page_segmented(&file_path_str, p_idx)
+                                                } else {
+                                                    true
+                                                }
+                                            } else {
+                                                true
+                                            };
+                                            if should_keep {
+                                                filtered_segs.push(seg);
+                                            }
+                                        }
+
+                                        self.reader_state.segments = filtered_segs
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(idx, seg)| DocumentSegment {
+                                                id: idx,
+                                                text: seg.text,
+                                                status: SegmentStatus::Idle,
+                                            })
+                                            .collect();
+                                        self.is_segmented = true;
                                     }
                                 }
                             }
@@ -431,9 +500,7 @@ impl eframe::App for UiApp {
                             if next_btn.clicked() {
                                 self.reader_state.current_page += 1;
                                 self.page_jump_text = (self.reader_state.current_page + 1).to_string();
-                                self.selected_segment_id = None;
-                                self.active_analysis = None;
-                                self.is_segmented = false; // Reset page segmentation mode on page turn
+                                self.check_cache_or_reset();
                             }
 
                             // Page indicator and Jump box
@@ -447,9 +514,7 @@ impl eframe::App for UiApp {
                                 if let Ok(page_num) = self.page_jump_text.trim().parse::<usize>() {
                                     if page_num >= 1 && page_num <= total_pages {
                                         self.reader_state.current_page = page_num - 1;
-                                        self.selected_segment_id = None;
-                                        self.active_analysis = None;
-                                        self.is_segmented = false; // Reset page segmentation mode
+                                        self.check_cache_or_reset();
                                     }
                                 }
                                 self.page_jump_text = (self.reader_state.current_page + 1).to_string();
@@ -460,9 +525,7 @@ impl eframe::App for UiApp {
                             if prev_btn.clicked() {
                                 self.reader_state.current_page -= 1;
                                 self.page_jump_text = (self.reader_state.current_page + 1).to_string();
-                                self.selected_segment_id = None;
-                                self.active_analysis = None;
-                                self.is_segmented = false; // Reset page segmentation mode on page turn
+                                self.check_cache_or_reset();
                             }
                         }
                     });
