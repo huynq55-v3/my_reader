@@ -271,30 +271,8 @@ impl UiApp {
                 }
                 
                 if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
-                    // Filter out segments that start on a previous page that is already segmented
-                    let mut filtered_segs = Vec::new();
-                    for seg in cached_segs {
-                        let page_idx_of_start = page_offsets_all.iter().position(|&(start, end)| {
-                            seg.start_offset >= start && seg.start_offset < end
-                        });
-                        
-                        let should_keep = if let Some(p_idx) = page_idx_of_start {
-                            if p_idx < current_page {
-                                !self.cache.is_page_segmented(&file_path_str, p_idx)
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        };
-                        
-                        if should_keep {
-                            filtered_segs.push(seg);
-                        }
-                    }
-
-                    if !filtered_segs.is_empty() {
-                        self.reader_state.segments = filtered_segs
+                    if !cached_segs.is_empty() {
+                        self.reader_state.segments = cached_segs
                             .into_iter()
                             .enumerate()
                             .map(|(idx, seg)| DocumentSegment {
@@ -446,33 +424,14 @@ impl UiApp {
                                 }
                             }
 
-                            // 2. Query the cache and apply our unified duplication-prevention filtering logic
+                            // 2. Query the cache and load the segments for the current page
                             if !file_path_str.is_empty() {
                                 let page_absolute_offsets = self.reader_state.get_page_absolute_offsets();
                                 let current_page = self.reader_state.current_page;
                                 if current_page < page_absolute_offsets.len() {
                                     let (page_start, page_end) = page_absolute_offsets[current_page];
                                     if let Some(cached_segs) = self.cache.get_segments_for_page(&file_path_str, page_start, page_end) {
-                                        let mut filtered_segs = Vec::new();
-                                        for seg in cached_segs {
-                                            let page_idx_of_start = page_absolute_offsets.iter().position(|&(start, end)| {
-                                                seg.start_offset >= start && seg.start_offset < end
-                                            });
-                                            let should_keep = if let Some(p_idx) = page_idx_of_start {
-                                                if p_idx < current_page {
-                                                    !self.cache.is_page_segmented(&file_path_str, p_idx)
-                                                } else {
-                                                    true
-                                                }
-                                            } else {
-                                                true
-                                            };
-                                            if should_keep {
-                                                filtered_segs.push(seg);
-                                            }
-                                        }
-
-                                        self.reader_state.segments = filtered_segs
+                                        self.reader_state.segments = cached_segs
                                             .into_iter()
                                             .enumerate()
                                             .map(|(idx, seg)| DocumentSegment {
