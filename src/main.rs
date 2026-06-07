@@ -353,7 +353,8 @@ impl UiApp {
 
         self.reader_state.segmentation_loading = true;
         self.reader_state.segmentation_error = None;
-        self.reader_state.segments.clear();
+        // Do not clear existing segments during loading to avoid color highlights disappearing on the page
+        // they will be overwritten anyway once the new segmentation completes.
 
         let current_page = self.reader_state.current_page;
         let file_path = self.reader_state.file_path.clone().unwrap_or_default();
