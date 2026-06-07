@@ -1032,9 +1032,7 @@ impl eframe::App for UiApp {
                             ui.add_space(6.0);
 
                             // Display current dragged/highlighted selection text if active
-                            if manual_active {
-                                let start = self.manual_start_offset.unwrap();
-                                let end = self.manual_end_offset.unwrap();
+                            if let (Some(start), Some(end)) = (self.manual_start_offset, self.manual_end_offset) {
                                 let selected_text = self.reader_state.get_text_range(start, end);
                                 ui.label(egui::RichText::new("Văn bản bôi đen:").weak().size(12.0));
                                 ui.label(egui::RichText::new(format!("\"{}\"", truncate_string(&selected_text, 120))).italics().size(13.0));
