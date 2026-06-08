@@ -49,7 +49,10 @@ pub enum WorkerMessage {
         config: AppConfig,
         context: String,
         target_text: String,
-        segment_id: usize,
+        file_path: String,
+        page_index: usize,
+        start_offset: usize,
+        end_offset: usize,
     },
     RenderPage {
         file_path: PathBuf,
@@ -61,7 +64,13 @@ pub enum UiMessage {
     FileLoaded(Result<ReaderState, String>),
     SegmentationResult(Result<SegmentationSuccess, String>),
     SegmentationBatchResult(Result<SegmentationBatchSuccess, String>),
-    AnalysisResult(usize, Result<String, String>),
+    AnalysisResult {
+        file_path: String,
+        page_index: usize,
+        start_offset: usize,
+        end_offset: usize,
+        result: Result<String, String>,
+    },
     PageRendered {
         page_index: usize,
         color_image: egui::ColorImage,
@@ -217,11 +226,20 @@ impl UiApp {
                             config,
                             context,
                             target_text,
-                            segment_id,
+                            file_path,
+                            page_index,
+                            start_offset,
+                            end_offset,
                         } => {
                             tokio::spawn(async move {
                                 let res = crate::ai_client::analyze_segment(&config, &context, &target_text).await;
-                                let _ = ui_tx.send(UiMessage::AnalysisResult(segment_id, res));
+                                let _ = ui_tx.send(UiMessage::AnalysisResult {
+                                    file_path,
+                                    page_index,
+                                    start_offset,
+                                    end_offset,
+                                    result: res,
+                                });
                                 ctx.request_repaint();
                             });
                         }
@@ -669,30 +687,44 @@ impl UiApp {
                         }
                     }
                 }
-                UiMessage::AnalysisResult(segment_id, res) => {
-                    if let Some(segment) = self.reader_state.segments.iter_mut().find(|s| s.id == segment_id) {
-                        match res {
-                            Ok(analysis) => {
-                                segment.status = SegmentStatus::Analyzed(analysis.clone());
-                                if self.selected_segment_id == Some(segment_id) {
-                                    self.active_analysis = Some(analysis.clone());
+                UiMessage::AnalysisResult {
+                    file_path,
+                    page_index,
+                    start_offset,
+                    end_offset,
+                    result,
+                } => {
+                    // 1. Cache the analysis explanation persistently using the absolute offsets
+                    if !file_path.is_empty() {
+                        if let Ok(ref analysis) = result {
+                            self.cache.update_segment_analysis(
+                                &file_path,
+                                start_offset,
+                                end_offset,
+                                analysis.clone(),
+                            );
+                        }
+                    }
+
+                    // 2. Update the segment status in the active view if the user is still on the same file and page
+                    let current_file_path_str = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
+                    if current_file_path_str == file_path && self.reader_state.current_page == page_index {
+                        if let Some(segment) = self.reader_state.segments.iter_mut().find(|s| {
+                            s.start_offset == start_offset && s.end_offset == end_offset
+                        }) {
+                            let segment_id = segment.id;
+                            match result {
+                                Ok(analysis) => {
+                                    segment.status = SegmentStatus::Analyzed(analysis.clone());
+                                    if self.selected_segment_id == Some(segment_id) {
+                                        self.active_analysis = Some(analysis);
+                                    }
                                 }
-                                
-                                // Cache the analysis explanation persistently
-                                let file_path_str = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
-                                if !file_path_str.is_empty() {
-                                    self.cache.update_segment_analysis(
-                                        &file_path_str,
-                                        segment.start_offset,
-                                        segment.end_offset,
-                                        analysis,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                segment.status = SegmentStatus::Error(e.clone());
-                                if self.selected_segment_id == Some(segment_id) {
-                                    self.active_analysis = Some(format!("Lỗi phân tích: {}", e));
+                                Err(e) => {
+                                    segment.status = SegmentStatus::Error(e.clone());
+                                    if self.selected_segment_id == Some(segment_id) {
+                                        self.active_analysis = Some(format!("Lỗi phân tích: {}", e));
+                                    }
                                 }
                             }
                         }
@@ -1183,23 +1215,26 @@ impl eframe::App for UiApp {
         if should_retry {
             if let Some(seg_id) = self.selected_segment_id {
                 let context = self.reader_state.get_sliding_window_context();
-                let target_text = if let Some(s) = self.reader_state.segments.iter().find(|s| s.id == seg_id) {
-                    s.text.clone()
-                } else {
-                    String::new()
-                };
+                let file_path = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
+                let page_index = self.reader_state.current_page;
 
                 if let Some(active_seg) = self.reader_state.segments.iter_mut().find(|s| s.id == seg_id) {
                     active_seg.status = SegmentStatus::Loading;
+                    let start_offset = active_seg.start_offset;
+                    let end_offset = active_seg.end_offset;
+                    let target_text = active_seg.text.clone();
+                    self.active_analysis = Some("Đang thử lại...".to_string());
+                    
+                    let _ = self.tx.blocking_send(WorkerMessage::AnalyzeSegment {
+                        config: self.config.clone(),
+                        context,
+                        target_text,
+                        file_path,
+                        page_index,
+                        start_offset,
+                        end_offset,
+                    });
                 }
-                self.active_analysis = Some("Đang thử lại...".to_string());
-                
-                let _ = self.tx.blocking_send(WorkerMessage::AnalyzeSegment {
-                    config: self.config.clone(),
-                    context,
-                    target_text,
-                    segment_id: seg_id,
-                });
             }
         }
 
@@ -1416,82 +1451,84 @@ impl eframe::App for UiApp {
                                                 egui::Stroke::new(1.0, egui::Color32::from_rgb(39, 39, 42)) // Standard dark border
                                             };
 
-                                            let frame = egui::Frame::none()
-                                                .fill(fill)
-                                                .stroke(stroke)
-                                                .rounding(6.0)
-                                                .inner_margin(12.0)
-                                                .outer_margin(egui::Margin::symmetric(0.0, 4.0));
+                                            let click_response = ui.push_id(segment.id, |ui| {
+                                                let frame = egui::Frame::none()
+                                                    .fill(fill)
+                                                    .stroke(stroke)
+                                                    .rounding(6.0)
+                                                    .inner_margin(12.0)
+                                                    .outer_margin(egui::Margin::symmetric(0.0, 4.0));
 
-                                            let response = frame.show(ui, |ui| {
-                                                ui.vertical(|ui| {
-                                                    ui.horizontal(|ui| {
-                                                        match &segment.status {
-                                                            SegmentStatus::Idle => {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!("Đoạn #{}", segment.id + 1))
-                                                                        .size(11.0)
-                                                                        .strong()
-                                                                        .color(if is_selected {
-                                                                            egui::Color32::from_rgb(113, 63, 4) // Darker brown-yellow
+                                                let response = frame.show(ui, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            match &segment.status {
+                                                                SegmentStatus::Idle => {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("Đoạn #{}", segment.id + 1))
+                                                                            .size(11.0)
+                                                                            .strong()
+                                                                            .color(if is_selected {
+                                                                                egui::Color32::from_rgb(113, 63, 4) // Darker brown-yellow
+                                                                            } else {
+                                                                                egui::Color32::from_rgb(113, 113, 122)
+                                                                            }),
+                                                                    );
+                                                                }
+                                                                SegmentStatus::Loading => {
+                                                                    ui.spinner();
+                                                                    ui.colored_label(
+                                                                        if is_selected {
+                                                                            egui::Color32::from_rgb(180, 83, 9)
                                                                         } else {
-                                                                            egui::Color32::from_rgb(113, 113, 122)
-                                                                        }),
-                                                                );
+                                                                            egui::Color32::from_rgb(245, 158, 11)
+                                                                        },
+                                                                        "Đang phân tích..."
+                                                                    );
+                                                                }
+                                                                SegmentStatus::Analyzed(_) => {
+                                                                    ui.colored_label(
+                                                                        if is_selected {
+                                                                            egui::Color32::from_rgb(21, 128, 61)
+                                                                        } else {
+                                                                            egui::Color32::from_rgb(16, 185, 129)
+                                                                        },
+                                                                        "✓ Đã phân tích"
+                                                                    );
+                                                                }
+                                                                SegmentStatus::Error(_) => {
+                                                                    ui.colored_label(
+                                                                        if is_selected {
+                                                                            egui::Color32::from_rgb(185, 28, 28)
+                                                                        } else {
+                                                                            egui::Color32::from_rgb(239, 68, 68)
+                                                                        },
+                                                                        "⚠ Gặp lỗi"
+                                                                    );
+                                                                }
                                                             }
-                                                            SegmentStatus::Loading => {
-                                                                ui.spinner();
-                                                                ui.colored_label(
-                                                                    if is_selected {
-                                                                        egui::Color32::from_rgb(180, 83, 9)
-                                                                    } else {
-                                                                        egui::Color32::from_rgb(245, 158, 11)
-                                                                    },
-                                                                    "Đang phân tích..."
-                                                                );
-                                                            }
-                                                            SegmentStatus::Analyzed(_) => {
-                                                                ui.colored_label(
-                                                                    if is_selected {
-                                                                        egui::Color32::from_rgb(21, 128, 61)
-                                                                    } else {
-                                                                        egui::Color32::from_rgb(16, 185, 129)
-                                                                    },
-                                                                    "✓ Đã phân tích"
-                                                                );
-                                                            }
-                                                            SegmentStatus::Error(_) => {
-                                                                ui.colored_label(
-                                                                    if is_selected {
-                                                                        egui::Color32::from_rgb(185, 28, 28)
-                                                                    } else {
-                                                                        egui::Color32::from_rgb(239, 68, 68)
-                                                                    },
-                                                                    "⚠ Gặp lỗi"
-                                                                );
-                                                            }
-                                                        }
+                                                        });
+                                                        
+                                                        ui.add_space(6.0);
+                                                        
+                                                        // High contrast text inside yellow selection frame
+                                                        let text_color = if is_selected {
+                                                            egui::Color32::from_rgb(28, 25, 23) // Stone-900 (Dark)
+                                                        } else {
+                                                            egui::Color32::from_rgb(228, 228, 231) // Zinc-200 (Light)
+                                                        };
+
+                                                        ui.label(
+                                                            egui::RichText::new(&segment.text)
+                                                                .size(14.5)
+                                                                .line_height(Some(20.0))
+                                                                .color(text_color),
+                                                        );
                                                     });
-                                                    
-                                                    ui.add_space(6.0);
-                                                    
-                                                    // High contrast text inside yellow selection frame
-                                                    let text_color = if is_selected {
-                                                        egui::Color32::from_rgb(28, 25, 23) // Stone-900 (Dark)
-                                                    } else {
-                                                        egui::Color32::from_rgb(228, 228, 231) // Zinc-200 (Light)
-                                                    };
+                                                }).response;
 
-                                                    ui.label(
-                                                        egui::RichText::new(&segment.text)
-                                                            .size(14.5)
-                                                            .line_height(Some(20.0))
-                                                            .color(text_color),
-                                                    );
-                                                });
-                                            }).response;
-
-                                            let click_response = ui.interact(response.rect, response.id, egui::Sense::click());
+                                                ui.interact(response.rect, response.id, egui::Sense::click())
+                                            }).inner;
                                             
                                             // Update hover status for the next frame
                                             if click_response.hovered() {
@@ -1502,7 +1539,6 @@ impl eframe::App for UiApp {
                                                 self.selected_segment_id = Some(segment.id);
                                                 
                                                 let status = segment.status.clone();
-                                                let segment_id = segment.id;
                                                 
                                                 match &status {
                                                     SegmentStatus::Analyzed(analysis) => {
@@ -1517,6 +1553,10 @@ impl eframe::App for UiApp {
                                                     SegmentStatus::Idle => {
                                                         // 1. Get Context and Target Text *before* borrowing mutable reference to segment
                                                         let context = self.reader_state.get_sliding_window_context();
+                                                        let file_path = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
+                                                        let page_index = self.reader_state.current_page;
+                                                        let start_offset = self.reader_state.segments[idx].start_offset;
+                                                        let end_offset = self.reader_state.segments[idx].end_offset;
                                                         let target_text = self.reader_state.segments[idx].text.clone();
                                                         
                                                         // 2. Perform mutable borrows of the reader_state
@@ -1528,7 +1568,10 @@ impl eframe::App for UiApp {
                                                             config: self.config.clone(),
                                                             context,
                                                             target_text,
-                                                            segment_id,
+                                                            file_path,
+                                                            page_index,
+                                                            start_offset,
+                                                            end_offset,
                                                         });
                                                     }
                                                 }
@@ -1895,6 +1938,10 @@ impl UiApp {
                                                 SegmentStatus::Idle => {
                                                     let context = self.reader_state.get_sliding_window_context();
                                                     let target_text = segment.text.clone();
+                                                    let file_path = self.reader_state.file_path.clone().unwrap_or_default().to_string_lossy().to_string();
+                                                    let page_index = self.reader_state.current_page;
+                                                    let start_offset = segment.start_offset;
+                                                    let end_offset = segment.end_offset;
                                                     
                                                     if let Some(s_mut) = self.reader_state.segments.iter_mut().find(|s| s.id == segment_id) {
                                                         s_mut.status = SegmentStatus::Loading;
@@ -1905,7 +1952,10 @@ impl UiApp {
                                                         config: self.config.clone(),
                                                         context,
                                                         target_text,
-                                                        segment_id,
+                                                        file_path,
+                                                        page_index,
+                                                        start_offset,
+                                                        end_offset,
                                                     });
                                                 }
                                                 _ => {}
