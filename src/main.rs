@@ -925,7 +925,7 @@ impl eframe::App for UiApp {
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.config.language, "Tiếng Việt".to_string(), "Tiếng Việt");
                                         ui.selectable_value(&mut self.config.language, "English".to_string(), "English");
-                                        ui.selectable_value(&mut self.config.language, "日本語".to_string(), "日本語");
+                                        ui.selectable_value(&mut self.config.language, "中国人".to_string(), "中国人");
                                     });
                                 ui.end_row();
                             });
@@ -1764,18 +1764,27 @@ fn configure_fonts(ctx: &egui::Context) {
         egui::FontData::from_static(include_bytes!("../Roboto-Regular.ttf")),
     );
 
+    // Load Chinese fallback font
+    fonts.font_data.insert(
+        "chinese_fallback".to_owned(),
+        egui::FontData::from_static(include_bytes!("../ZCOOLXiaoWei-Regular.ttf")),
+    );
+
     // Prepend "roboto" as the primary font family for Proportional (default UI text) and Monospace (code/quotes)
-    fonts
+    // Add "chinese_fallback" as secondary font family for CJK characters
+    let proportional = fonts
         .families
         .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "roboto".to_owned());
+        .or_default();
+    proportional.insert(0, "roboto".to_owned());
+    proportional.push("chinese_fallback".to_owned());
 
-    fonts
+    let monospace = fonts
         .families
         .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "roboto".to_owned());
+        .or_default();
+    monospace.insert(0, "roboto".to_owned());
+    monospace.push("chinese_fallback".to_owned());
 
     ctx.set_fonts(fonts);
 }

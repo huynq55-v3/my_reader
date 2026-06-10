@@ -72,19 +72,19 @@ pub async fn analyze_segment(
     url.push_str("chat/completions");
 
     let system_prompt = format!(
-        "Bạn là một trợ lý AI chuyên nghiệp phân tích tài liệu chuyên sâu. \
-        Hãy phân tích đoạn văn bản được chọn (Target Segment) dựa trên toàn bộ ngữ cảnh xung quanh (trang trước, trang hiện tại, và trang sau) được cung cấp. \
-        Đưa ra giải thích chi tiết, tóm tắt ý chính, giải nghĩa thuật ngữ nếu cần thiết. \
-        Phản hồi hoàn toàn bằng {}, định dạng bằng Markdown ngắn gọn, rõ ràng, dễ hiểu, trực quan.",
+        "You are a professional AI assistant specializing in in-depth document analysis. \
+        Analyze the selected text (Target Segment) based on the provided surrounding context (previous page, current page, and next page). \
+        Provide detailed explanations, summarize main points, and define terminology if necessary. \
+        Respond completely in {}, formatted using concise, clear, easy-to-understand, and visual Markdown.",
         config.language
     );
 
     let user_prompt = format!(
-        "Dưới đây là ngữ cảnh tài liệu (gồm trang trước, trang hiện tại và trang sau nếu có):\n\n\
+        "Here is the document context (including previous, current, and next pages if available):\n\n\
         {}\n\n\
-        Đoạn văn bản được chọn cần phân tích sâu (Target Segment):\n\n\
+        The selected text that needs deep analysis (Target Segment):\n\n\
         >>> {} <<<\n\n\
-        Hãy phân tích đoạn văn bản trên dựa trên ngữ cảnh này.",
+        Please analyze the selected text based on this context.",
         context, target_segment
     );
 
@@ -218,28 +218,28 @@ pub async fn segment_text(
     }
     url.push_str("chat/completions");
 
-    let system_prompt = "Bạn là một trợ lý AI chuyên nghiệp phân tích cấu trúc văn bản. \
-        Nhiệm vụ của bạn là phân mảnh (segment) nội dung văn bản được cung cấp thành các đoạn thông tin logic, mạch lạc (Document Segments). \
-        Để tối ưu hóa tốc độ và giảm thiểu token phản hồi từ LLM, bạn KHÔNG cần viết lại toàn bộ nội dung của các phân đoạn. \
-        Thay vào đó, với mỗi phân đoạn, bạn chỉ cần cung cấp đúng 3 TỪ đầu tiên (trường 'prefix') và 3 TỪ cuối cùng (trường 'suffix') của phân đoạn đó. \
+    let system_prompt = "You are a professional AI assistant specializing in analyzing document structure. \
+        Your task is to segment the provided document content into logical, coherent information blocks (Document Segments). \
+        To optimize speed and minimize response tokens from the LLM, you do NOT need to rewrite the full content of the segments. \
+        Instead, for each segment, you only need to provide the exact first 3 words (field 'prefix') and the exact last 3 words (field 'suffix') of that segment. \
         \
-        YÊU CẦU ĐỘ DÀI: Mỗi phân đoạn có độ dài tối đa là 1 đoạn văn (paragraph). Nếu gặp ranh giới đoạn văn (kết thúc đoạn văn / xuống dòng mới), \
-        bạn BẮT BUỘC phải kết thúc phân đoạn đó và bắt đầu phân đoạn mới. Tuyệt đối không gộp nhiều đoạn văn lại thành một phân đoạn. \
+        LENGTH REQUIREMENT: Each segment must be at most 1 paragraph long. If you encounter a paragraph boundary (end of paragraph / new line), \
+        you MUST end that segment and start a new one. Do not combine multiple paragraphs into a single segment. \
         \
-        QUAN TRỌNG: Nếu một đoạn văn bị cắt đôi do ranh giới trang (cuối trang trước và đầu trang sau), bạn PHẢI ghép nối chúng lại thành một phân đoạn duy nhất hoàn chỉnh và liền mạch: \
-        lấy 3 từ đầu của phần ở cuối trang trước làm 'prefix', và 3 từ cuối của phần ở đầu trang sau làm 'suffix' (bỏ các tiêu đề/chân trang phân tách ở giữa). \
+        IMPORTANT: If a paragraph is split across page boundaries (end of the previous page and beginning of the next page), you MUST merge them into a single, complete, and continuous segment: \
+        use the first 3 words from the end of the previous page as the 'prefix', and the last 3 words from the start of the next page as the 'suffix' (ignoring any headers/footers in between). \
         \
-        Ví dụ: Với phân đoạn 'Văn học là nhân học rất tuyệt vời', prefix sẽ là 'Văn học là' và suffix sẽ là 'rất tuyệt vời'. \
-        Hãy đảm bảo lấy chính xác các từ từ văn bản gốc (giữ nguyên dấu câu, hoa thường). \
+        Example: For the segment 'Literature is humanity which is wonderful', the prefix will be 'Literature is humanity' and the suffix will be 'which is wonderful'. \
+        Make sure to extract the words exactly from the source text (preserving punctuation, casing). \
         \
-        Bạn PHẢI trả về kết quả dưới dạng JSON có cấu trúc chính xác theo schema sau:\n\
+        You MUST return the result in JSON format matching this schema:\n\
         {\n\
           \"segments\": [\n\
-            { \"id\": 1, \"prefix\": \"3 từ đầu của phân đoạn 1\", \"suffix\": \"3 từ cuối của phân đoạn 1\" },\n\
+            { \"id\": 1, \"prefix\": \"first 3 words of segment 1\", \"suffix\": \"last 3 words of segment 1\" },\n\
             ...\n\
           ]\n\
         }\n\
-        Không thêm bất kỳ chữ nào ngoài JSON block."
+        Do not add any text outside of the JSON block."
         .to_string();
 
     let payload = ChatCompletionRequest {
@@ -251,7 +251,7 @@ pub async fn segment_text(
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: format!("Vui lòng phân đoạn văn bản sau đây:\n\n{}", combined_text),
+                content: format!("Please segment the following text:\n\n{}", combined_text),
             },
         ],
         temperature: 0.2,
