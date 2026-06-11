@@ -14,6 +14,9 @@ pub struct AppConfig {
     
     #[serde(default = "default_window_size")]
     pub context_window_size: usize,
+
+    #[serde(default)]
+    pub recent_documents: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -22,8 +25,9 @@ impl Default for AppConfig {
             api_key: std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
             base_url: "https://api.deepseek.com/v1".to_string(),
             model: "deepseek-v4-flash".to_string(),
-            language: "Tiếng Việt".to_string(),
+            language: "viet nam".to_string(),
             context_window_size: 1,
+            recent_documents: Vec::new(),
         }
     }
 }

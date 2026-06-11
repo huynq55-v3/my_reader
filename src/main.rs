@@ -125,6 +125,7 @@ pub struct UiApp {
     manual_fixed_end: Option<usize>,
     manual_dragging: bool,
     manual_drag_start_word_idx: Option<usize>,
+    last_page_scroll_time: f64,
 }
 
 impl UiApp {
@@ -302,6 +303,7 @@ impl UiApp {
             manual_fixed_end: None,
             manual_dragging: false,
             manual_drag_start_word_idx: None,
+            last_page_scroll_time: 0.0,
         }
     }
 
@@ -547,6 +549,17 @@ impl UiApp {
                             self.reader_state = state;
                             self.page_jump_text = (self.reader_state.current_page + 1).to_string();
                             self.check_cache_or_reset();
+
+                            if let Some(ref path) = self.reader_state.file_path {
+                                let path_str = path.to_string_lossy().to_string();
+                                let recents = &mut self.config.recent_documents;
+                                recents.retain(|x| x != &path_str);
+                                recents.insert(0, path_str);
+                                recents.truncate(10);
+                                if let Err(e) = self.config.save() {
+                                    self.error_message = Some(format!("Không thể lưu lịch sử mở file: {}", e));
+                                }
+                            }
                         }
                         Err(e) => {
                             self.error_message = Some(e);
@@ -1247,34 +1260,100 @@ impl eframe::App for UiApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(9, 9, 11)).inner_margin(16.0))
             .show(ctx, |ui| {
-                if self.reader_state.pages.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(ui.available_height() * 0.35);
-                            ui.heading(
-                                egui::RichText::new("AI Context-Aware Desktop Reader")
-                                    .strong()
-                                    .size(26.0)
-                                    .color(egui::Color32::from_rgb(59, 130, 246)),
-                            );
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Mở file văn bản (.txt) hoặc file PDF (.pdf) để bắt đầu trải nghiệm.")
-                                    .weak()
-                                    .size(15.0),
-                            );
-                            ui.add_space(16.0);
-                            
-                            if ui.add(egui::Button::new("📂 Chọn File Ngay").min_size(egui::vec2(150.0, 36.0))).clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Tài liệu (PDF, TXT)", &["pdf", "txt"])
-                                    .pick_file()
-                                {
-                                    self.loading_file = true;
-                                    let _ = self.tx.blocking_send(WorkerMessage::LoadFile(path));
-                                }
+                // Lăn chuột giữa lật trang (kèm cooldown 300ms)
+                if !self.reader_state.pages.is_empty() && !self.is_config_open && !self.is_batch_open && ui.ui_contains_pointer() {
+                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                    let current_time = ui.input(|i| i.time);
+                    if current_time - self.last_page_scroll_time > 0.3 {
+                        if scroll_delta < -2.0 {
+                            // Cuộn xuống -> sang trang tiếp theo
+                            if self.reader_state.current_page + 1 < self.reader_state.pages.len() {
+                                self.reader_state.current_page += 1;
+                                self.page_jump_text = (self.reader_state.current_page + 1).to_string();
+                                self.check_cache_or_reset();
+                                self.last_page_scroll_time = current_time;
                             }
-                        });
+                        } else if scroll_delta > 2.0 {
+                            // Cuộn lên -> quay lại trang trước
+                            if self.reader_state.current_page > 0 {
+                                self.reader_state.current_page -= 1;
+                                self.page_jump_text = (self.reader_state.current_page + 1).to_string();
+                                self.check_cache_or_reset();
+                                self.last_page_scroll_time = current_time;
+                            }
+                        }
+                    }
+                }
+
+                if self.reader_state.pages.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.15);
+                        ui.heading(
+                            egui::RichText::new("AI Context-Aware Desktop Reader")
+                                .strong()
+                                .size(26.0)
+                                .color(egui::Color32::from_rgb(59, 130, 246)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Mở file văn bản (.txt) hoặc file PDF (.pdf) để bắt đầu trải nghiệm.")
+                                .weak()
+                                .size(15.0),
+                        );
+                        ui.add_space(16.0);
+                        
+                        if ui.add(egui::Button::new("📂 Chọn File Ngay").min_size(egui::vec2(180.0, 40.0))).clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Tài liệu (PDF, TXT)", &["pdf", "txt"])
+                                .pick_file()
+                            {
+                                self.loading_file = true;
+                                let _ = self.tx.blocking_send(WorkerMessage::LoadFile(path));
+                            }
+                        }
+
+                        if !self.config.recent_documents.is_empty() {
+                            ui.add_space(40.0);
+                            ui.label(
+                                egui::RichText::new("📚 Tài liệu vừa mở gần đây")
+                                    .strong()
+                                    .size(16.0)
+                                    .color(egui::Color32::from_rgb(147, 197, 253))
+                            );
+                            ui.add_space(12.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height(250.0)
+                                .id_source("recent_files_scroll")
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        for path_str in &self.config.recent_documents {
+                                            let path = std::path::PathBuf::from(path_str);
+                                            if !path.exists() {
+                                                continue;
+                                            }
+                                            let file_name = path.file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| path_str.clone());
+
+                                            let btn = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(format!("📄 {}", file_name))
+                                                        .size(13.5)
+                                                )
+                                                .min_size(egui::vec2(320.0, 32.0))
+                                                .fill(egui::Color32::from_rgb(20, 20, 23))
+                                            ).on_hover_text(path_str);
+
+                                            if btn.clicked() {
+                                                self.loading_file = true;
+                                                let _ = self.tx.blocking_send(WorkerMessage::LoadFile(path));
+                                            }
+                                            ui.add_space(6.0);
+                                        }
+                                    });
+                                });
+                        }
                     });
                 } else {
                     let is_pdf = self.reader_state.file_path.as_ref()
